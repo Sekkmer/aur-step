@@ -319,3 +319,16 @@ sudo AUR_STEP_RUN_ROOT_INTEGRATION=1 \
 
 The install test uses a uniquely named fake package and a drop guard to remove
 it if the test returns early or an assertion unwinds.
+
+## License
+
+Licensed under either of:
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in `aur-step` is dual-licensed as above, without additional terms
+or conditions.
