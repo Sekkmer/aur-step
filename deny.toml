@@ -10,6 +10,7 @@ allow = [
     "Apache-2.0",
     "MIT",
     "Unicode-3.0",
+    "Zlib",
 ]
 confidence-threshold = 0.8
 
@@ -25,9 +26,7 @@ external-default-features = "allow"
 allow = []
 allow-workspace = true
 deny = []
-skip = [
-    { crate = "hashbrown@0.14.5", reason = "hashlink 0.9 used by rusqlite 0.32 has not converged on indexmap's hashbrown 0.17" },
-]
+skip = []
 skip-tree = []
 
 [sources]
