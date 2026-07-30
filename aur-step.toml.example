@@ -1,0 +1,10 @@
+# Required unless AUR_STEP_BUILD_USER or SUDO_USER supplies it.
+build_user = "alice"
+
+# Optional. Defaults are derived from the build user's passwd entry.
+# build_root = "/home/alice/aurbuild"
+# yay_build_dir = "/home/alice/.cache/yay"
+
+# Optional trusted root state and AUR endpoint.
+# state_db = "/var/lib/aur-step/state.sqlite3"
+# aur_url = "https://aur.archlinux.org"
