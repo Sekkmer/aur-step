@@ -1122,6 +1122,11 @@ mod commands {
             );
         }
         let trust = db.get_trust(package)?;
+        if persistently_reviewed && !exactly_granted && trust_baseline_missing(trust.as_ref()) {
+            bail!(
+                "{package} has a legacy commit review without a maintainer/source trust baseline; run `aur-step fetch {package}`, inspect it, and review it again"
+            );
+        }
         if trust.as_ref().is_some_and(maintainer_changed) {
             bail!("{package} has an unapproved AUR maintainer transition; inspect and review it explicitly");
         }
@@ -2238,6 +2243,10 @@ mod commands {
         trust.reviewed_at.is_some() && trust.reviewed_maintainer != trust.observed_maintainer
     }
 
+    fn trust_baseline_missing(trust: Option<&crate::model::TrustRecord>) -> bool {
+        trust.and_then(|trust| trust.reviewed_at.as_ref()).is_none()
+    }
+
     fn add_trust_findings(
         findings: &mut Vec<security::SecurityFinding>,
         trust: Option<&crate::model::TrustRecord>,
@@ -2705,8 +2714,9 @@ mod commands {
 
         use super::{
             apply_provider_selections, execute_upgrade_package, is_package_artifact_name,
-            parse_provider_selections, parse_reviewed_commit_grants, upgrade_build_plan,
-            upgrade_status_from_comparison, validate_package_name, UpgradePackageOutput,
+            parse_provider_selections, parse_reviewed_commit_grants, trust_baseline_missing,
+            upgrade_build_plan, upgrade_status_from_comparison, validate_package_name,
+            UpgradePackageOutput,
         };
         use camino::Utf8PathBuf;
 
@@ -2728,6 +2738,25 @@ mod commands {
             assert_eq!(grants[0].commit, hash);
             assert!(parse_reviewed_commit_grants(&["example=abc".to_owned()]).is_err());
             assert!(parse_reviewed_commit_grants(&["missing-separator".to_owned()]).is_err());
+        }
+
+        #[test]
+        fn missing_trust_record_requires_a_new_baseline() {
+            assert!(trust_baseline_missing(None));
+            let trust = crate::model::TrustRecord {
+                observed_maintainer: Some("maintainer".to_owned()),
+                reviewed_maintainer: None,
+                observed_at: Some("now".to_owned()),
+                reviewed_at: None,
+                observed_sources: Vec::new(),
+                reviewed_sources: Vec::new(),
+            };
+            assert!(trust_baseline_missing(Some(&trust)));
+            let reviewed = crate::model::TrustRecord {
+                reviewed_at: Some("now".to_owned()),
+                ..trust
+            };
+            assert!(!trust_baseline_missing(Some(&reviewed)));
         }
 
         #[test]

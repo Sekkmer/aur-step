@@ -199,6 +199,8 @@ sudo aur-step install --reviewed-commit visual-studio-code-bin=<full-sha> visual
 The grant cannot approve maintainer transitions or high-risk source findings.
 `inspect --json` reports tracked maintainer state and source findings. Review
 requires `--allow-maintainer-change` or `--allow-high-risk` when intentional.
+Package records created by older aur-step versions must be fetched and reviewed
+once to establish the new maintainer/source trust baseline before building.
 
 High-level install accepts the same explicit provider selection shape as
 `install-repo-deps`:

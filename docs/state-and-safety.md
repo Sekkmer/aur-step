@@ -293,6 +293,8 @@ High-level multi-package commands bind this grant to a named package with
 SQLite also records observed/reviewed AUR maintainers, artifact provenance, and
 fetch/review/build/install journal entries. A maintainer transition invalidates
 automation until explicitly approved during review.
+Legacy records without a trust snapshot are fail-closed at build time and need
+one new fetch/inspect/review cycle.
 
 Upgrade plan output must keep blocked packages explicit. If a package has a new
 available version but the checkout is not reviewed, it should report
