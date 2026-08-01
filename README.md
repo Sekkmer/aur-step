@@ -10,8 +10,8 @@ Primary use case:
 
 ```bash
 sudo aur-step install visual-studio-code-bin
-sudo aur-step install --assume-reviewed visual-studio-code-bin
-sudo aur-step install --assume-reviewed --auto-aur-deps some-package
+sudo aur-step review visual-studio-code-bin
+sudo aur-step install visual-studio-code-bin
 sudo aur-step upgrade
 ```
 
@@ -38,7 +38,7 @@ root supervisor
 configured build user
   -> clones AUR repos
   -> reviews/updates PKGBUILD trees
-  -> runs makepkg
+  -> runs makepkg inside bubblewrap with an isolated HOME
   -> executes all PKGBUILD code
 ```
 
@@ -63,14 +63,24 @@ The tool must never execute `PKGBUILD`, `prepare()`, `build()`, `check()`, or `p
 - Providing a TUI.
 - Hiding PKGBUILD review.
 - Solving every dependency cycle automatically in the first version.
-- Building in a clean chroot in the first version.
+- Reproducing Arch clean-chroot builds byte-for-byte.
 
 ## Configuration
+
+Runtime requirements are Arch Linux tools from `base-devel`, plus `git`,
+`curl`, `bubblewrap`, and `libarchive` (`bsdtar`). Install the binary with:
+
+```bash
+cargo build --release --locked
+sudo install -o root -g root -m 0755 target/release/aur-step /usr/local/bin/aur-step
+```
 
 Install a root-owned configuration at `/etc/aur-step.toml`:
 
 ```toml
 build_user = "alice"
+sandbox_builds = true
+allow_build_network = false
 ```
 
 When omitted, `build_root` defaults to `<build-user-home>/aurbuild`,
@@ -93,14 +103,40 @@ Without a config file, `build_user` may be supplied through
 
 ## Security Boundary
 
-Build commands receive a small environment, no inherited stdin, and no Git
-credential prompts. Generated package archives are opened without following
-symlinks, checked for build-user ownership and hard links, copied into
-root-owned temporary staging, and parsed by `pacman -Qp` before installation.
+Fetch and upgrade refresh never evaluate `PKGBUILD`; they accept only a tracked
+`.SRCINFO` whose working copy matches `HEAD:.SRCINFO`. After review, makepkg runs
+inside bubblewrap with an empty dedicated HOME and no view of the configured
+user's normal home. Source verification receives network access, while the
+actual build is offline unless `allow_build_network=true` is explicitly set.
 
-This is privilege separation, not a build sandbox. A `PKGBUILD` still has the
-normal filesystem and network access of the build user. Review AUR changes and
-use a clean chroot or stronger sandbox when that threat model requires one.
+Generated package archives are opened without following symlinks, checked for
+build-user ownership and hard links, SHA-256 bound to the reviewed build commit,
+copied into root-owned staging, parsed by `pacman -Qp`, and audited for install
+scripts, hooks, services, scheduled tasks, authentication changes, setid files,
+and other privileged contents before installation.
+
+Bubblewrap contains AUR code during source verification and building. It does
+not make installed software trustworthy: privileged archive findings still
+require an explicit artifact grant. Low-level `install-built` uses
+`--allow-privileged-files`; multi-package `install` and `upgrade` require the
+narrow `--allow-privileged-files PACKAGE` form. Opaque binary packages remain
+high risk.
+A dedicated non-login build account or Arch clean chroot remains useful defense
+in depth.
+
+For a fresh installation, an optional dedicated identity further separates
+checkout ownership from the interactive user:
+
+```bash
+sudo useradd --system --create-home \
+  --home-dir /var/lib/aur-step/build-user \
+  --shell /usr/bin/nologin aurbuild
+```
+
+Then configure `build_user = "aurbuild"` and a build root below that home. Do
+not switch an existing installation blindly: imported Yay trees, signing keys,
+and source caches need an explicit migration or a clean refetch. Bubblewrap is
+therefore the safe default even when the configured build user is interactive.
 
 ## Command Shape
 
@@ -111,6 +147,7 @@ aur-step install <pkg>...
 aur-step upgrade
 aur-step status
 aur-step inspect <pkg>
+aur-step audit <pkg>
 aur-step remove <pkg>...
 ```
 
@@ -138,9 +175,9 @@ packages are currently managed in `aur-step` state. Non-plan `remove` runs the
 pacman removal as root and deletes package records from state only after pacman
 succeeds.
 
-`install` intentionally has a review gate. Without `--assume-reviewed`, it
-fetches the AUR tree, refreshes `.SRCINFO`, classifies dependencies, and stops
-before installing dependencies or executing the build.
+`install` intentionally has a review gate. It fetches the AUR tree, validates
+the committed `.SRCINFO`, classifies dependencies, and stops before installing
+dependencies or executing the build.
 
 After reviewing the checkout, record the trusted commit:
 
@@ -148,9 +185,20 @@ After reviewing the checkout, record the trusted commit:
 aur-step review visual-studio-code-bin
 ```
 
-Future `install` runs can proceed without `--assume-reviewed` only while the
+Future `install` runs can proceed only while the
 current git commit still matches `reviewed_commit`. If `fetch` pulls a new
 commit, review must be recorded again.
+
+For a one-run automation grant, bind approval to an exact package and full
+commit instead of bypassing review broadly:
+
+```bash
+sudo aur-step install --reviewed-commit visual-studio-code-bin=<full-sha> visual-studio-code-bin
+```
+
+The grant cannot approve maintainer transitions or high-risk source findings.
+`inspect --json` reports tracked maintainer state and source findings. Review
+requires `--allow-maintainer-change` or `--allow-high-risk` when intentional.
 
 High-level install accepts the same explicit provider selection shape as
 `install-repo-deps`:
@@ -180,6 +228,10 @@ the matching provider dependency.
 `reviewed_commit`. The diff object reports whether the checkout is current or
 changed, lists changed files, and includes the git diff from the reviewed commit
 to the current commit.
+
+`audit --json` reads the root-owned ledger for a managed package: observed and
+reviewed maintainer/source state, build artifact hashes, and fetch/review/build/
+install journal entries.
 
 Machine-readable mode:
 
@@ -272,7 +324,8 @@ is common until the checkout is refreshed.
 `upgrade --plan --refresh` refreshes metadata before comparing versions:
 
 1. Run `git pull --ff-only` in existing git checkouts as the build user.
-2. Regenerate `.SRCINFO` with `makepkg --printsrcinfo` as the build user.
+2. Validate the fetched working `.SRCINFO` against `HEAD:.SRCINFO` without
+   evaluating `PKGBUILD`.
 3. Report old/new commit, `metadata_refreshed`, `refresh_error`,
    `ready_for_build`, `planned_actions`, and `build_blocked_reasons` per
    package.

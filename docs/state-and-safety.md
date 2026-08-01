@@ -12,7 +12,7 @@ Root supervisor zone:
 
 Build user zone:
   AUR git repositories
-  PKGBUILD execution
+  bubblewrap-contained PKGBUILD execution
   makepkg output
 ```
 
@@ -72,10 +72,11 @@ exec git/makepkg
 ```
 
 The parent receives pre-exec failures over a close-on-exec error pipe and waits
-for the child directly. Generated files such as `.SRCINFO` are opened by the
-child after UID/GID drop so they stay owned by the build user.
+for the child directly. Fetched `.SRCINFO` is never regenerated before review:
+aur-step reads the tracked copy through Git and requires the worktree copy to
+match it.
 
-## Environment for Builds
+## Environment and Sandbox for Builds
 
 Build environment should be minimal:
 
@@ -90,7 +91,7 @@ LANG from host if safe
 LC_* from host if safe
 ```
 
-Do not forward:
+Do not forward or mount:
 
 ```text
 SSH_AUTH_SOCK
@@ -105,9 +106,14 @@ NODE_AUTH_TOKEN
 any token/password/secret variable
 ```
 
-Standard input is `/dev/null` for build-user commands. This prevents AUR code
-and Git credential prompts from consuming input intended for the root
-supervisor.
+Standard input is `/dev/null` for build-user commands. Makepkg runs in a
+bubblewrap mount/PID/user namespace with only the package checkout, a dedicated
+empty HOME, read-only system files, the pacman database/cache, `/proc`, `/dev`,
+and temporary storage. Source verification is online; the build phase is
+offline by default. `allow_build_network=true` is an explicit compatibility
+exception for builds that cannot operate offline. The AUR checkout's own `.git`
+directory is hidden from makepkg; VCS source clones below the build tree remain
+available.
 
 ## Dependency Safety
 
@@ -256,8 +262,8 @@ Plan mode may read package metadata and discover local package artifacts, but it
 must not call `pacman -S`, `pacman -U`, or `pacman -R`.
 
 `upgrade --plan --refresh` is a metadata-mutating plan mode: it may run
-`git pull --ff-only` and `makepkg --printsrcinfo` as the build user, but it must
-not run package build functions or install artifacts.
+`git pull --ff-only` and validate committed `.SRCINFO`, but it must not evaluate
+`PKGBUILD`, run package build functions, or install artifacts.
 
 ## Filesystem and Artifact Checks
 
@@ -273,12 +279,20 @@ child of `build_root` or `yay_build_dir`.
 Before `pacman -U`, each package archive must be a regular, single-link file
 owned by the configured build user. It is copied through a no-follow descriptor
 into a root-owned mode-0700 staging directory beside the state database.
-`pacman -Qp` must parse the staged copy before installation. Staging is removed
-after the install attempt.
+`pacman -Qp` must parse the staged copy before installation. The staged archive
+must match the SHA-256 and manifest hash recorded for the current reviewed build
+commit. Its paths and modes are audited for install scripts, pacman hooks,
+services, scheduled tasks, authentication/authorization configuration,
+tmpfiles/sysusers rules, device nodes, and setid files. Findings require the
+explicit `--allow-privileged-files` grant. Staging is removed after the install
+attempt.
 
-These controls protect the root boundary from path substitution. They do not
-sandbox `PKGBUILD` execution: build code retains the build user's normal
-filesystem and network access.
+High-level multi-package commands bind this grant to a named package with
+`--allow-privileged-files PACKAGE`; it is never a run-wide wildcard.
+
+SQLite also records observed/reviewed AUR maintainers, artifact provenance, and
+fetch/review/build/install journal entries. A maintainer transition invalidates
+automation until explicitly approved during review.
 
 Upgrade plan output must keep blocked packages explicit. If a package has a new
 available version but the checkout is not reviewed, it should report

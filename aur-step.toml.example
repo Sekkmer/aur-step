@@ -5,6 +5,13 @@ build_user = "alice"
 # build_root = "/home/alice/aurbuild"
 # yay_build_dir = "/home/alice/.cache/yay"
 
+# Build PKGBUILDs in bubblewrap with a dedicated empty HOME by default.
+# Source verification gets network access; the actual build does not unless
+# explicitly enabled for packages such as VCS builds.
+# sandbox_builds = true
+# allow_build_network = false
+# sandbox_home = "/home/alice/aurbuild/.aur-step-home"
+
 # Optional trusted root state and AUR endpoint.
 # state_db = "/var/lib/aur-step/state.sqlite3"
 # aur_url = "https://aur.archlinux.org"

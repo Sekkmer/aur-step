@@ -51,3 +51,29 @@ pub struct ProviderDependency {
     pub dependency: String,
     pub candidates: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TrustRecord {
+    pub observed_maintainer: Option<String>,
+    pub reviewed_maintainer: Option<String>,
+    pub observed_at: Option<String>,
+    pub reviewed_at: Option<String>,
+    pub observed_sources: Vec<String>,
+    pub reviewed_sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArtifactRecord {
+    pub path: String,
+    pub commit: String,
+    pub sha256: String,
+    pub manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalRecord {
+    pub action: String,
+    pub commit: Option<String>,
+    pub details: serde_json::Value,
+    pub created_at: String,
+}

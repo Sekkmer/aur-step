@@ -28,6 +28,12 @@ sudo aur-step review visual-studio-code-bin
 Review records the current git commit. Later fetches that advance the checkout
 make `reviewed=false` until review is recorded again.
 
+Read persistent provenance and the action journal with:
+
+```bash
+sudo aur-step audit visual-studio-code-bin --json
+```
+
 ## Dependencies
 
 ```bash
@@ -58,10 +64,29 @@ sudo aur-step review visual-studio-code-bin
 sudo aur-step install visual-studio-code-bin --json
 ```
 
-For explicitly trusted local runs:
+For an exact one-run automation grant:
 
 ```bash
-sudo aur-step install --assume-reviewed visual-studio-code-bin --json
+sudo aur-step install \
+  --reviewed-commit visual-studio-code-bin=<full-sha> \
+  visual-studio-code-bin --json
+```
+
+Source findings and maintainer transitions require deliberate review:
+
+```bash
+sudo aur-step review --allow-high-risk visual-studio-code-bin
+sudo aur-step review --allow-maintainer-change visual-studio-code-bin
+```
+
+Packages that intentionally ship services, hooks, install scripts, or other
+privileged integration require a separate artifact approval:
+
+```bash
+sudo aur-step install-built --allow-privileged-files visual-studio-code-bin
+sudo aur-step install \
+  --allow-privileged-files visual-studio-code-bin \
+  visual-studio-code-bin
 ```
 
 Recursive AUR dependencies remain explicit:

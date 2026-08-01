@@ -17,7 +17,9 @@
   - print latest commit,
   - print diff since reviewed commit if known.
 - Implement `.SRCINFO` refresh:
-  - run `makepkg --printsrcinfo` as build user when `.SRCINFO` is absent.
+  - require `.SRCINFO` to be committed by the AUR maintainer,
+  - validate the worktree copy against `HEAD:.SRCINFO` without evaluating
+    `PKGBUILD` before review.
 
 Status: implemented.
 
@@ -70,7 +72,8 @@ outside makepkg.
   - install built.
 - Stop on AUR dependencies unless `--auto-aur-deps` exists and is enabled.
 
-Status: implemented with `--assume-reviewed` as the explicit review gate.
+Status: implemented with persistent exact-commit review and optional one-run
+`--reviewed-commit PACKAGE=COMMIT` grants.
 `--provider dependency=package` is threaded into high-level install.
 `--auto-aur-deps` recursively installs confirmed AUR dependencies while
 preserving the review gate for each package.
@@ -117,6 +120,10 @@ failures; blocked or failed packages make the command fail.
 - Config, state, build directories, and package artifacts use no-follow checks.
 - Artifacts are ownership/link validated, staged under root ownership, and
   parsed by `pacman -Qp` before installation.
+- Builds run in bubblewrap with an isolated HOME and offline build phase.
+- Artifact hashes/manifests, maintainer observations, and security actions are
+  persisted in the root-owned SQLite database.
+- Privileged archive contents require an explicit install grant.
 - Root subprocesses use fixed `/usr/bin` paths and review diffs disable external
   diff/text-conversion drivers.
 - Expand the environment allowlist for build commands if specific safe variables are needed.

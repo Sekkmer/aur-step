@@ -67,6 +67,8 @@ aur-step inspect <pkg> --json
 ```
 
 `reviewed` is true only when the current git commit equals `reviewed_commit`.
+`security_findings`, `trust`, and `maintainer_changed` expose source and AUR
+identity risk without evaluating the PKGBUILD.
 
 When a reviewed commit exists, `review_diff` is present:
 
@@ -91,6 +93,18 @@ Review diff statuses:
 - `changed`
 - `missing_current_commit`
 - `error`
+
+## Security Audit
+
+Command:
+
+```bash
+aur-step audit <pkg> --json
+```
+
+The output contains the managed package record, observed/reviewed maintainer and
+source sets, artifact commit/SHA-256/manifest provenance, and ordered security
+journal entries.
 
 ## Upgrade Plan
 
@@ -164,8 +178,13 @@ contains:
 - `install`
 
 `install --auto-aur-deps` recursively installs confirmed AUR dependencies before
-the package that requires them. Review gates still apply unless
-`--assume-reviewed` is set.
+the package that requires them. Review gates still apply. Repeated
+`--reviewed-commit PACKAGE=COMMIT` arguments can grant one run for exact commits
+without changing persistent review state.
+
+Build output includes `sandboxed`, `build_network`, and `artifact_audits`.
+Install output repeats the audits performed on root-owned staged copies and
+reports whether privileged contents were explicitly allowed.
 
 ## Remove Plan
 

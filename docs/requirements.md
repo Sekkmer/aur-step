@@ -65,8 +65,9 @@ Required flow:
 
    as the configured build user.
 
-5. Generate or refresh `.SRCINFO` if needed as the build user.
-6. Parse `.SRCINFO`.
+5. Require a tracked `.SRCINFO` and verify the worktree copy equals
+   `HEAD:.SRCINFO` without evaluating `PKGBUILD`.
+6. Parse the committed `.SRCINFO` as data.
 7. Classify dependencies:
 
    ```text
@@ -103,10 +104,14 @@ Required flow:
 11. Build as the configured build user:
 
     ```bash
-    makepkg --noconfirm --needed
+    makepkg --verifysource --noconfirm
+    makepkg --noconfirm
     ```
 
-    Do not use `makepkg -s` unless dependency installation has been disabled or controlled.
+    Run both phases inside bubblewrap with an isolated HOME. Give the source
+    verification phase network access; keep the actual build offline by
+    default. Do not use `makepkg -s` unless dependency installation has been
+    disabled or controlled.
 
 12. Install built package as root:
 
@@ -125,11 +130,11 @@ aur-step install <pkg>
 fetches and classifies, then stops for review.
 
 ```text
-aur-step install --assume-reviewed <pkg>
+aur-step install --reviewed-commit <pkg>=<full-sha> <pkg>
 ```
 
-continues through repo dependency installation, user build, and root package
-installation.
+grants a single run for that exact commit. It cannot approve maintainer changes
+or high-risk source findings.
 
 Current high-level install behavior:
 
@@ -137,8 +142,8 @@ Current high-level install behavior:
   selections to the relevant dependency install step.
 - `install --auto-aur-deps <pkg>` recursively installs confirmed AUR
   dependencies before the package that needs them.
-- Recursive AUR dependency installation still honors review gating for each
-  fetched package unless `--assume-reviewed` is set.
+- Recursive AUR dependency installation honors review gating for every fetched
+  package; exact one-run grants must name each package and commit.
 - Without `--auto-aur-deps`, confirmed AUR dependencies remain a stop point.
 - `install --json` emits one top-level result containing package step outputs in
   dependency order.
@@ -241,7 +246,8 @@ Current upgrade plans also expose build readiness:
 Current non-plan `upgrade` execution:
 
 - runs `pacman -Syu --noconfirm` as root first,
-- refreshes managed AUR checkouts and `.SRCINFO` as the build user,
+- refreshes managed AUR checkouts and validates committed `.SRCINFO` as the
+  build user without evaluating `PKGBUILD`,
 - executes only packages with `ready_for_build=true`,
 - accepts repeated `--provider dependency=package` selections and applies them
   to matching package dependency plans,
@@ -337,7 +343,8 @@ Automatic mechanical steps are okay.
 Trust decisions should be visible.
 ```
 
-For new packages, default to requiring review unless `--assume-reviewed` is passed.
+For new packages, require persistent review or an exact one-run
+`--reviewed-commit PACKAGE=COMMIT` grant.
 
 Review output should include:
 
@@ -359,9 +366,9 @@ Current review persistence:
 aur-step review <pkg>
 ```
 
-records the current checkout commit as `reviewed_commit` in state. High-level
-`install` may proceed without `--assume-reviewed` only if the current checkout
-commit still matches that reviewed commit.
+records the current checkout commit and observed AUR maintainer as reviewed
+state. High-level `install` may proceed only if the current checkout commit and
+maintainer still match that reviewed state.
 
 Current `inspect --json` review output:
 
@@ -371,6 +378,8 @@ Current `inspect --json` review output:
   `error`.
 - For changed checkouts, `review_diff` includes changed files, `git diff --stat`,
   and the full git diff from reviewed commit to current commit.
+- `security_findings` reports skipped checksums, mutable sources, and install
+  scripts; `trust` and `maintainer_changed` expose AUR identity transitions.
 
 ## JSON Output
 

@@ -248,6 +248,7 @@ fn plan_modes_do_not_require_root_or_call_pacman_install() -> Result<()> {
         package_dir.join("fake-aur-step-1.2.3-4-any.pkg.tar.zst"),
         b"not a real package; plan mode must not inspect contents",
     )?;
+    chown_to_test_user_if_root(&package_dir.join("fake-aur-step-1.2.3-4-any.pkg.tar.zst"))?;
     let config = write_config(
         temp.path(),
         &build_root,
@@ -849,8 +850,20 @@ fn root_fetch_clones_local_fake_aur_repo_as_build_user() -> Result<()> {
     chmod(&build_root, 0o755)?;
 
     let source_repo = source_root.join("fake-aur-step");
+    let execution_sentinel = temp.path().join("fetch-must-not-evaluate-pkgbuild");
     fs::create_dir_all(&source_repo)?;
-    fs::write(source_repo.join("PKGBUILD"), fake_pkgbuild())?;
+    fs::write(
+        source_repo.join("PKGBUILD"),
+        format!(
+            "touch {}\n{}",
+            execution_sentinel.display(),
+            fake_pkgbuild()
+        ),
+    )?;
+    fs::write(
+        source_repo.join(".SRCINFO"),
+        fake_build_srcinfo("fake-aur-step", "1.2.3", "4"),
+    )?;
     run("git", &["init"], &source_repo)?;
     run(
         "git",
@@ -862,7 +875,7 @@ fn root_fetch_clones_local_fake_aur_repo_as_build_user() -> Result<()> {
         &["config", "user.name", "aur-step test"],
         &source_repo,
     )?;
-    run("git", &["add", "PKGBUILD"], &source_repo)?;
+    run("git", &["add", "PKGBUILD", ".SRCINFO"], &source_repo)?;
     run("git", &["commit", "-m", "fake package"], &source_repo)?;
     run(
         "git",
@@ -906,6 +919,10 @@ fn root_fetch_clones_local_fake_aur_repo_as_build_user() -> Result<()> {
     let checkout = build_root.join("fake-aur-step");
     assert!(checkout.join("PKGBUILD").exists());
     assert!(checkout.join(".SRCINFO").exists());
+    assert!(
+        !execution_sentinel.exists(),
+        "fetch must not evaluate PKGBUILD before review"
+    );
     let owner_uid = fs::metadata(checkout.join(".SRCINFO"))?.uid();
     assert_ne!(owner_uid, 0, ".SRCINFO must not be root-owned");
     Ok(())
@@ -945,6 +962,10 @@ fn root_builds_local_fake_aur_package_as_build_user() -> Result<()> {
     let source_repo = source_root.join("fake-aur-step");
     fs::create_dir_all(&source_repo)?;
     fs::write(source_repo.join("PKGBUILD"), fake_pkgbuild())?;
+    fs::write(
+        source_repo.join(".SRCINFO"),
+        fake_build_srcinfo("fake-aur-step", "1.2.3", "4"),
+    )?;
     run("git", &["init"], &source_repo)?;
     run(
         "git",
@@ -956,7 +977,7 @@ fn root_builds_local_fake_aur_package_as_build_user() -> Result<()> {
         &["config", "user.name", "aur-step test"],
         &source_repo,
     )?;
-    run("git", &["add", "PKGBUILD"], &source_repo)?;
+    run("git", &["add", "PKGBUILD", ".SRCINFO"], &source_repo)?;
     run("git", &["commit", "-m", "fake package"], &source_repo)?;
     run(
         "git",
@@ -986,6 +1007,16 @@ fn root_builds_local_fake_aur_package_as_build_user() -> Result<()> {
         "fetch failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&fetch.stdout),
         String::from_utf8_lossy(&fetch.stderr)
+    );
+
+    let review = Command::new(aur_step())
+        .args(["--config", path_str(&config)?, "review", "fake-aur-step"])
+        .output()
+        .context("failed to review fake package before build")?;
+    assert!(
+        review.status.success(),
+        "review failed: {}",
+        String::from_utf8_lossy(&review.stderr)
     );
 
     let build = Command::new(aur_step())
@@ -1067,6 +1098,10 @@ fn root_install_built_installs_artifact_and_updates_state() -> Result<()> {
         source_repo.join("PKGBUILD"),
         fake_pkgbuild_with_name(package_name, "1.2.3", "4"),
     )?;
+    fs::write(
+        source_repo.join(".SRCINFO"),
+        fake_build_srcinfo(package_name, "1.2.3", "4"),
+    )?;
     run("git", &["init"], &source_repo)?;
     run(
         "git",
@@ -1078,7 +1113,7 @@ fn root_install_built_installs_artifact_and_updates_state() -> Result<()> {
         &["config", "user.name", "aur-step test"],
         &source_repo,
     )?;
-    run("git", &["add", "PKGBUILD"], &source_repo)?;
+    run("git", &["add", "PKGBUILD", ".SRCINFO"], &source_repo)?;
     run(
         "git",
         &["commit", "-m", "fake install package"],
@@ -1112,6 +1147,16 @@ fn root_install_built_installs_artifact_and_updates_state() -> Result<()> {
         "fetch failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&fetch.stdout),
         String::from_utf8_lossy(&fetch.stderr)
+    );
+
+    let review = Command::new(aur_step())
+        .args(["--config", path_str(&config)?, "review", package_name])
+        .output()
+        .context("failed to review fake package before install build")?;
+    assert!(
+        review.status.success(),
+        "review failed: {}",
+        String::from_utf8_lossy(&review.stderr)
     );
 
     let build = Command::new(aur_step())
@@ -1206,6 +1251,10 @@ fn root_upgrade_plan_refreshes_fake_aur_metadata_as_build_user() -> Result<()> {
         source_repo.join("PKGBUILD"),
         fake_pkgbuild_with_version("1.0.0", "1"),
     )?;
+    fs::write(
+        source_repo.join(".SRCINFO"),
+        fake_named_srcinfo("fake-aur-step", "1.0.0", "1"),
+    )?;
     run("git", &["init"], &source_repo)?;
     run(
         "git",
@@ -1217,7 +1266,7 @@ fn root_upgrade_plan_refreshes_fake_aur_metadata_as_build_user() -> Result<()> {
         &["config", "user.name", "aur-step test"],
         &source_repo,
     )?;
-    run("git", &["add", "PKGBUILD"], &source_repo)?;
+    run("git", &["add", "PKGBUILD", ".SRCINFO"], &source_repo)?;
     run("git", &["commit", "-m", "fake package 1.0.0"], &source_repo)?;
     run(
         "git",
@@ -1262,7 +1311,11 @@ fn root_upgrade_plan_refreshes_fake_aur_metadata_as_build_user() -> Result<()> {
         source_repo.join("PKGBUILD"),
         fake_pkgbuild_with_version("1.1.0", "1"),
     )?;
-    run("git", &["add", "PKGBUILD"], &source_repo)?;
+    fs::write(
+        source_repo.join(".SRCINFO"),
+        fake_named_srcinfo("fake-aur-step", "1.1.0", "1"),
+    )?;
+    run("git", &["add", "PKGBUILD", ".SRCINFO"], &source_repo)?;
     run("git", &["commit", "-m", "fake package 1.1.0"], &source_repo)?;
     run("git", &["push", "origin", "master"], &source_repo)?;
     seed_state(
@@ -1382,6 +1435,12 @@ pkgbase = {name}
     )
 }
 
+fn fake_build_srcinfo(name: &str, pkgver: &str, pkgrel: &str) -> String {
+    format!(
+        "pkgbase = {name}\n\tpkgdesc = fake package for aur-step tests\n\tpkgver = {pkgver}\n\tpkgrel = {pkgrel}\n\tarch = any\n\tlicense = MIT\n\npkgname = {name}\n"
+    )
+}
+
 fn seed_state(
     db_path: &Path,
     package: &str,
@@ -1494,6 +1553,20 @@ fn chmod(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 
+fn chown_to_test_user_if_root(path: &Path) -> Result<()> {
+    if !is_root() {
+        return Ok(());
+    }
+    let user = usable_build_user().ok_or_else(|| anyhow::anyhow!("no non-root test user"))?;
+    let status = Command::new("chown")
+        .args([user.as_str(), path_str(path)?])
+        .status()?;
+    if !status.success() {
+        bail!("failed to chown {} to {user}", path.display());
+    }
+    Ok(())
+}
+
 fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -1503,6 +1576,11 @@ fn root_integration_requested() -> bool {
 }
 
 fn current_user_name() -> Result<String> {
+    if is_root() {
+        if let Some(user) = usable_build_user() {
+            return Ok(user);
+        }
+    }
     let output = Command::new("id")
         .arg("-un")
         .output()

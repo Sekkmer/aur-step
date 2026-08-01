@@ -16,6 +16,9 @@ pub struct Config {
     pub state_db: Utf8PathBuf,
     pub yay_build_dir: Utf8PathBuf,
     pub aur_url: String,
+    pub sandbox_builds: bool,
+    pub allow_build_network: bool,
+    pub sandbox_home: Utf8PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -26,6 +29,9 @@ struct ConfigFile {
     state_db: Option<Utf8PathBuf>,
     yay_build_dir: Option<Utf8PathBuf>,
     aur_url: Option<String>,
+    sandbox_builds: Option<bool>,
+    allow_build_network: Option<bool>,
+    sandbox_home: Option<Utf8PathBuf>,
 }
 
 impl Config {
@@ -57,14 +63,20 @@ impl Config {
         }
         let home = Utf8PathBuf::from_path_buf(user.dir)
             .map_err(|path| anyhow::anyhow!("build user home path is not UTF-8: {path:?}"))?;
+        let build_root = raw.build_root.unwrap_or_else(|| home.join("aurbuild"));
         let config = Self {
             build_user,
-            build_root: raw.build_root.unwrap_or_else(|| home.join("aurbuild")),
+            sandbox_home: raw
+                .sandbox_home
+                .unwrap_or_else(|| build_root.join(".aur-step-home")),
+            build_root,
             state_db: raw
                 .state_db
                 .unwrap_or_else(|| Utf8PathBuf::from(DEFAULT_STATE_DB)),
             yay_build_dir: raw.yay_build_dir.unwrap_or_else(|| home.join(".cache/yay")),
             aur_url: raw.aur_url.unwrap_or_else(|| DEFAULT_AUR_URL.to_owned()),
+            sandbox_builds: raw.sandbox_builds.unwrap_or(true),
+            allow_build_network: raw.allow_build_network.unwrap_or(false),
         };
         config.validate()?;
         Ok(config)
@@ -78,6 +90,10 @@ impl Config {
         fs_safety::validate_absolute_normalized(&self.build_root, "build_root")?;
         fs_safety::validate_absolute_normalized(&self.state_db, "state_db")?;
         fs_safety::validate_absolute_normalized(&self.yay_build_dir, "yay_build_dir")?;
+        fs_safety::validate_absolute_normalized(&self.sandbox_home, "sandbox_home")?;
+        if self.sandbox_home.parent() != Some(self.build_root.as_path()) {
+            bail!("sandbox_home must be a direct child of build_root");
+        }
         if self.aur_url.trim().is_empty() {
             bail!("aur_url must not be empty");
         }

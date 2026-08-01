@@ -48,8 +48,20 @@ pub enum Command {
         #[arg(value_name = "PACKAGE")]
         package: String,
     },
+    /// Show persistent maintainer, artifact provenance, and security journal state.
+    Audit {
+        /// Managed AUR package name.
+        #[arg(value_name = "PACKAGE")]
+        package: String,
+    },
     /// Record the current checkout commit as reviewed.
     Review {
+        /// Approve findings such as install scripts, mutable sources, or skipped checksums.
+        #[arg(long)]
+        allow_high_risk: bool,
+        /// Approve an AUR maintainer transition recorded since the prior review.
+        #[arg(long)]
+        allow_maintainer_change: bool,
         /// Managed AUR package name.
         #[arg(value_name = "PACKAGE")]
         package: String,
@@ -89,6 +101,9 @@ pub enum Command {
         /// Print the pacman -U plan without installing artifacts.
         #[arg(long)]
         plan: bool,
+        /// Permit privileged package contents reported by the artifact policy.
+        #[arg(long)]
+        allow_privileged_files: bool,
         /// Managed AUR package name.
         #[arg(value_name = "PACKAGE")]
         package: String,
@@ -116,12 +131,15 @@ pub enum Command {
     },
     /// Fetch, review-gate, dependency-install, build, and install AUR packages.
     #[command(
-        after_long_help = "Examples:\n  sudo aur-step install visual-studio-code-bin --json\n  aur-step review visual-studio-code-bin\n  sudo aur-step install visual-studio-code-bin --json\n  sudo aur-step install --assume-reviewed --auto-aur-deps --provider ttf-font=noto-fonts some-package --json"
+        after_long_help = "Examples:\n  sudo aur-step install visual-studio-code-bin --json\n  aur-step review visual-studio-code-bin\n  sudo aur-step install visual-studio-code-bin --json\n  sudo aur-step install --reviewed-commit some-package=<sha> --auto-aur-deps --provider ttf-font=noto-fonts some-package --json"
     )]
     Install {
-        /// Treat fetched checkouts as reviewed for this run.
-        #[arg(long)]
-        assume_reviewed: bool,
+        /// Grant one-run review to an exact PACKAGE=COMMIT pair; repeat for dependencies.
+        #[arg(long = "reviewed-commit", value_name = "PACKAGE=COMMIT")]
+        reviewed_commits: Vec<String>,
+        /// Permit privileged contents for an exact package; repeat as needed.
+        #[arg(long, value_name = "PACKAGE")]
+        allow_privileged_files: Vec<String>,
         /// Recursively install confirmed AUR dependencies, preserving review gates.
         #[arg(long)]
         auto_aur_deps: bool,
@@ -140,11 +158,14 @@ pub enum Command {
         /// Plan only; do not run pacman -Syu, build, or install artifacts.
         #[arg(long)]
         plan: bool,
-        /// In plan mode, refresh AUR git checkouts and .SRCINFO as the build user.
+        /// In plan mode, refresh AUR git checkouts and validate committed .SRCINFO.
         #[arg(long)]
         refresh: bool,
         /// Select an explicit provider candidate, for example ttf-font=noto-fonts.
         #[arg(long = "provider")]
         providers: Vec<String>,
+        /// Permit privileged contents for an exact package; repeat as needed.
+        #[arg(long, value_name = "PACKAGE")]
+        allow_privileged_files: Vec<String>,
     },
 }

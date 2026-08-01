@@ -141,6 +141,14 @@ pub fn lookup_build_user(user_name: &str) -> Result<BuildUser> {
 }
 
 pub fn ensure_user_owned_dir(path: &Utf8Path, user: &BuildUser) -> Result<()> {
+    ensure_user_owned_dir_mode(path, user, 0o755)
+}
+
+pub fn ensure_private_user_owned_dir(path: &Utf8Path, user: &BuildUser) -> Result<()> {
+    ensure_user_owned_dir_mode(path, user, 0o700)
+}
+
+fn ensure_user_owned_dir_mode(path: &Utf8Path, user: &BuildUser, mode: libc::mode_t) -> Result<()> {
     let directory = fs_safety::ensure_directory_nofollow(path)
         .with_context(|| format!("failed to create build directory {path} safely"))?;
     // SAFETY: directory is an owned descriptor opened without following symlinks.
@@ -149,7 +157,7 @@ pub fn ensure_user_owned_dir(path: &Utf8Path, user: &BuildUser) -> Result<()> {
             .with_context(|| format!("failed to chown {path} to {}", user.name));
     }
     // SAFETY: directory is an owned descriptor for the build directory.
-    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) } < 0 {
+    if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } < 0 {
         return Err(io::Error::last_os_error())
             .with_context(|| format!("failed to chmod build directory {path}"));
     }

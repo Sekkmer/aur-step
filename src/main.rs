@@ -5,6 +5,7 @@ mod deps;
 mod exec;
 mod fs_safety;
 mod model;
+mod security;
 mod srcinfo;
 
 use anyhow::Result;
@@ -33,7 +34,19 @@ fn run() -> Result<()> {
             commands::import_yay(&config, &db, include_cache_only, cli.json)
         }
         Command::Inspect { package } => commands::inspect(&config, &db, &package, cli.json),
-        Command::Review { package } => commands::review(&config, &db, &package, cli.json),
+        Command::Audit { package } => commands::audit(&db, &package, cli.json),
+        Command::Review {
+            allow_high_risk,
+            allow_maintainer_change,
+            package,
+        } => commands::review(
+            &config,
+            &db,
+            &package,
+            allow_high_risk,
+            allow_maintainer_change,
+            cli.json,
+        ),
         Command::Deps { recursive, package } => {
             commands::deps(&config, &db, &package, recursive, cli.json)
         }
@@ -43,13 +56,23 @@ fn run() -> Result<()> {
             package,
         } => commands::install_repo_deps(&config, &db, &package, plan, &providers, cli.json),
         Command::Build { package } => commands::build(&config, &db, &package, cli.json),
-        Command::InstallBuilt { plan, package } => {
-            commands::install_built(&config, &db, &package, plan, cli.json)
-        }
+        Command::InstallBuilt {
+            plan,
+            allow_privileged_files,
+            package,
+        } => commands::install_built(
+            &config,
+            &db,
+            &package,
+            plan,
+            allow_privileged_files,
+            cli.json,
+        ),
         Command::Clean { package } => commands::clean(&config, &db, &package, cli.json),
         Command::Remove { plan, packages } => commands::remove(&db, &packages, plan, cli.json),
         Command::Install {
-            assume_reviewed,
+            reviewed_commits,
+            allow_privileged_files,
             auto_aur_deps,
             providers,
             packages,
@@ -57,7 +80,8 @@ fn run() -> Result<()> {
             &config,
             &db,
             &packages,
-            assume_reviewed,
+            &reviewed_commits,
+            &allow_privileged_files,
             auto_aur_deps,
             &providers,
             cli.json,
@@ -66,15 +90,24 @@ fn run() -> Result<()> {
             plan,
             refresh,
             providers,
-        } => commands::upgrade(&config, &db, plan, refresh, &providers, cli.json),
+            allow_privileged_files,
+        } => commands::upgrade(
+            &config,
+            &db,
+            plan,
+            refresh,
+            &providers,
+            &allow_privileged_files,
+            cli.json,
+        ),
     }
 }
 
 mod commands {
-    use super::{deps, exec, fs_safety, srcinfo, Config, Database};
+    use super::{deps, exec, fs_safety, security, srcinfo, Config, Database};
     use anyhow::{bail, Context, Result};
     use camino::{Utf8Path, Utf8PathBuf};
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File, OpenOptions};
     use std::io;
@@ -148,15 +181,41 @@ mod commands {
                 stderr_file: Some(&config.build_root.join(format!("{package}.fetch.log"))),
             })?;
         }
-        refresh_srcinfo(config, &user, &path)?;
         let last_commit = git_head(&user, &path)?;
         db.upsert_package_stub(package, path.as_str())?;
         db.update_last_commit(package, last_commit.as_deref())?;
+        let committed_srcinfo = validate_committed_srcinfo(&user, &path)?;
+        let observed_sources = security::source_values(&committed_srcinfo);
+        let observed_maintainer = fetch_aur_maintainer(config, &user, &path, package)?;
+        db.update_observed_trust(
+            package,
+            observed_maintainer
+                .as_ref()
+                .and_then(|maintainer| maintainer.as_deref()),
+            &observed_sources,
+        )?;
+        let trust = db.get_trust(package)?;
+        let maintainer_changed = trust.as_ref().is_some_and(maintainer_changed);
+        db.journal(
+            "fetch",
+            Some(package),
+            last_commit.as_deref(),
+            &serde_json::json!({
+                "repo_url": repo_url,
+                "observed_maintainer": observed_maintainer,
+                "observed_sources": observed_sources,
+                "maintainer_changed": maintainer_changed,
+                "srcinfo_source": "git_head"
+            }),
+        )?;
         Ok(FetchOutput {
             package: package.to_owned(),
             repo_url,
             path,
             last_commit,
+            observed_maintainer: observed_maintainer.flatten(),
+            maintainer_changed,
+            srcinfo_source: "git_head",
         })
     }
 
@@ -250,6 +309,18 @@ mod commands {
         let reviewed = is_reviewed_commit(reviewed_commit, last_commit.as_deref());
         let review_diff =
             inspect_review_diff(&user, &path, reviewed_commit, last_commit.as_deref());
+        let committed_srcinfo = validate_committed_srcinfo(&user, &path)?;
+        let repository_files = git_repository_files(&user, &path)?;
+        let current_sources = security::source_values(&committed_srcinfo);
+        let trust = db.get_trust(package)?;
+        let mut security_findings =
+            security::source_findings(&committed_srcinfo, &repository_files);
+        add_trust_findings(
+            &mut security_findings,
+            trust.as_ref(),
+            Some(&current_sources),
+        );
+        let maintainer_changed = trust.as_ref().is_some_and(maintainer_changed);
         emit(
             json,
             "inspection",
@@ -263,12 +334,39 @@ mod commands {
                 last_commit,
                 reviewed,
                 review_diff,
+                security_findings,
+                trust,
+                maintainer_changed,
                 state_record: record,
             },
         )
     }
 
-    pub fn review(config: &Config, db: &Database, package: &str, json: bool) -> Result<()> {
+    pub fn audit(db: &Database, package: &str, json: bool) -> Result<()> {
+        validate_package_name(package)?;
+        let package_record = db
+            .get_package(package)?
+            .ok_or_else(|| anyhow::anyhow!("{package} is not managed by aur-step"))?;
+        emit(
+            json,
+            "security audit",
+            AuditOutput {
+                package: package_record,
+                trust: db.get_trust(package)?,
+                artifacts: db.list_build_artifacts(package)?,
+                journal: db.list_journal(package)?,
+            },
+        )
+    }
+
+    pub fn review(
+        config: &Config,
+        db: &Database,
+        package: &str,
+        allow_high_risk: bool,
+        allow_maintainer_change: bool,
+        json: bool,
+    ) -> Result<()> {
         validate_package_name(package)?;
         let user = exec::lookup_build_user(&config.build_user)?;
         let path = package_path(config, db, package)?;
@@ -278,8 +376,57 @@ mod commands {
         let Some(commit) = git_head(&user, &path)? else {
             bail!("{path} is not a git checkout; run aur-step fetch {package} first");
         };
+        let committed_srcinfo = validate_committed_srcinfo(&user, &path)?;
+        let repository_files = git_repository_files(&user, &path)?;
+        let observed_sources = security::source_values(&committed_srcinfo);
+        let observed_maintainer = fetch_aur_maintainer(config, &user, &path, package)?;
+        db.update_observed_trust(
+            package,
+            observed_maintainer
+                .as_ref()
+                .and_then(|maintainer| maintainer.as_deref()),
+            &observed_sources,
+        )?;
+        let trust = db.get_trust(package)?;
+        let mut security_findings =
+            security::source_findings(&committed_srcinfo, &repository_files);
+        add_trust_findings(
+            &mut security_findings,
+            trust.as_ref(),
+            Some(&observed_sources),
+        );
+        if !security_findings.is_empty() && !allow_high_risk {
+            bail!(
+                "{} has high-risk source findings ({}); inspect them and rerun review with --allow-high-risk if intentional",
+                package,
+                security_findings
+                    .iter()
+                    .map(|finding| finding.code)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let has_maintainer_change = trust.as_ref().is_some_and(maintainer_changed);
+        if has_maintainer_change && !allow_maintainer_change {
+            bail!(
+                "{} changed AUR maintainer from {:?} to {:?}; inspect the transition and rerun review with --allow-maintainer-change if intentional",
+                package,
+                trust.as_ref().and_then(|item| item.reviewed_maintainer.as_deref()),
+                trust.as_ref().and_then(|item| item.observed_maintainer.as_deref())
+            );
+        }
         db.update_last_commit(package, Some(&commit))?;
         db.update_reviewed_commit(package, &commit)?;
+        db.approve_observed_maintainer(package)?;
+        db.journal(
+            "review",
+            Some(package),
+            Some(&commit),
+            &serde_json::json!({
+                "security_findings": security_findings,
+                "maintainer_change_approved": has_maintainer_change,
+            }),
+        )?;
         emit(
             json,
             "review recorded",
@@ -287,6 +434,8 @@ mod commands {
                 package,
                 path,
                 reviewed_commit: commit,
+                security_findings,
+                maintainer_change_approved: has_maintainer_change,
             },
         )
     }
@@ -529,23 +678,57 @@ mod commands {
                 path
             );
         }
-        refresh_srcinfo(config, &user, &path)?;
-        exec::run_as_user(exec::UserCommand {
-            user: &user,
-            program: "makepkg",
-            args: vec!["--noconfirm".to_owned()],
-            cwd: &path,
-            stdout_file: Some(&path.join(".aur-step-makepkg.log")),
-            stderr_file: Some(&path.join(".aur-step-makepkg.log")),
-        })?;
+        let current_commit = require_reviewed_package(config, db, package, None)?;
+        validate_generated_srcinfo(config, &user, &path)?;
+        run_makepkg(
+            config,
+            &user,
+            &path,
+            vec!["--verifysource".to_owned(), "--noconfirm".to_owned()],
+            true,
+            &path.join(".aur-step-source.log"),
+        )?;
+        run_makepkg(
+            config,
+            &user,
+            &path,
+            vec!["--noconfirm".to_owned()],
+            config.allow_build_network,
+            &path.join(".aur-step-makepkg.log"),
+        )?;
         let artifacts = package_artifacts(&path, &user)?;
+        let mut artifact_audits = Vec::new();
+        let mut artifact_records = Vec::new();
+        for artifact in &artifacts {
+            let audit = security::audit_package(artifact)?;
+            artifact_records.push(crate::model::ArtifactRecord {
+                path: artifact.to_string(),
+                commit: current_commit.clone(),
+                sha256: audit.sha256.clone(),
+                manifest_sha256: audit.manifest_sha256.clone(),
+            });
+            artifact_audits.push(ArtifactAuditOutput {
+                path: artifact.clone(),
+                audit,
+            });
+        }
+        db.replace_build_artifacts(package, &artifact_records)?;
         let version = srcinfo::parse_file(&path.join(".SRCINFO"))?.version();
         db.update_last_built_version(package, version.as_deref())?;
+        db.journal(
+            "build",
+            Some(package),
+            Some(&current_commit),
+            &artifact_audits,
+        )?;
         Ok(BuildOutput {
             package: package.to_owned(),
             path,
             version,
             artifacts,
+            artifact_audits,
+            sandboxed: config.sandbox_builds,
+            build_network: config.allow_build_network,
         })
     }
 
@@ -554,9 +737,10 @@ mod commands {
         db: &Database,
         package: &str,
         plan_only: bool,
+        allow_privileged_files: bool,
         json: bool,
     ) -> Result<()> {
-        let output = install_built_inner(config, db, package, plan_only)?;
+        let output = install_built_inner(config, db, package, plan_only, allow_privileged_files)?;
         emit(
             json,
             if plan_only {
@@ -573,6 +757,7 @@ mod commands {
         db: &Database,
         package: &str,
         plan_only: bool,
+        allow_privileged_files: bool,
     ) -> Result<InstallBuiltOutput> {
         validate_package_name(package)?;
         let user = exec::lookup_build_user(&config.build_user)?;
@@ -587,10 +772,49 @@ mod commands {
             "--noconfirm".to_owned(),
         ];
         args.extend(artifacts.iter().map(ToString::to_string));
+        let mut artifact_audits = Vec::new();
         if !plan_only {
             exec::require_root()?;
+            let current_commit = require_reviewed_package(config, db, package, None)?;
             let (staging, staged_artifacts) =
                 stage_package_artifacts(config, &path, &artifacts, &user)?;
+            for (original, staged) in artifacts.iter().zip(&staged_artifacts) {
+                let audit = security::audit_package(staged)?;
+                let provenance = db
+                    .get_build_artifact(package, original.as_str())?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{} has no recorded build provenance; rebuild {} before installing",
+                            original,
+                            package
+                        )
+                    })?;
+                if provenance.commit != current_commit
+                    || provenance.sha256 != audit.sha256
+                    || provenance.manifest_sha256 != audit.manifest_sha256
+                {
+                    bail!(
+                        "artifact provenance changed after the reviewed build: {}; rebuild before installing",
+                        original
+                    );
+                }
+                if !audit.privileged_findings.is_empty() && !allow_privileged_files {
+                    bail!(
+                        "{} contains privileged package entries ({}); inspect the artifact audit and rerun with --allow-privileged-files if intentional",
+                        original,
+                        audit
+                            .privileged_findings
+                            .iter()
+                            .map(|finding| finding.code)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                artifact_audits.push(ArtifactAuditOutput {
+                    path: original.clone(),
+                    audit,
+                });
+            }
             let mut install_args = vec![
                 "-U".to_owned(),
                 "--needed".to_owned(),
@@ -607,6 +831,15 @@ mod commands {
             if !status.success() {
                 bail!("pacman -U failed for built package artifacts");
             }
+            db.journal(
+                "install",
+                Some(package),
+                Some(&current_commit),
+                &serde_json::json!({
+                    "allow_privileged_files": allow_privileged_files,
+                    "artifact_audits": artifact_audits,
+                }),
+            )?;
         }
         let version = srcinfo::parse_file(&path.join(".SRCINFO"))
             .ok()
@@ -621,6 +854,8 @@ mod commands {
             version,
             pacman_args: args,
             artifacts,
+            artifact_audits,
+            allow_privileged_files,
         })
     }
 
@@ -716,7 +951,8 @@ mod commands {
         config: &Config,
         db: &Database,
         packages: &[String],
-        assume_reviewed: bool,
+        reviewed_commit_args: &[String],
+        allow_privileged_file_args: &[String],
         auto_aur_deps: bool,
         provider_selection_args: &[String],
         json: bool,
@@ -728,6 +964,8 @@ mod commands {
         for package in packages {
             validate_package_name(package)?;
         }
+        let reviewed_commits = parse_reviewed_commit_grants(reviewed_commit_args)?;
+        let allowed_privileged_packages = parse_package_grants(allow_privileged_file_args)?;
         let provider_selections = parse_provider_selections(provider_selection_args)?;
         let mut state = InstallRunState {
             installing: Vec::new(),
@@ -741,7 +979,8 @@ mod commands {
                 package,
                 None,
                 InstallOptions {
-                    assume_reviewed,
+                    reviewed_commits: &reviewed_commits,
+                    allowed_privileged_packages: &allowed_privileged_packages,
                     auto_aur_deps,
                     provider_selections: &provider_selections,
                 },
@@ -753,7 +992,8 @@ mod commands {
             "install complete",
             InstallOutput {
                 completed: state.completed,
-                assume_reviewed,
+                reviewed_commits,
+                allowed_privileged_packages: allowed_privileged_packages.into_iter().collect(),
                 auto_aur_deps,
                 packages: state.outputs,
             },
@@ -787,9 +1027,7 @@ mod commands {
             provider_selections_for_plan(&dependency_plan, options.provider_selections);
         apply_provider_selections(&mut dependency_plan, &selected_provider_entries)?;
 
-        if !options.assume_reviewed {
-            require_reviewed_package(config, db, package)?;
-        }
+        require_reviewed_package(config, db, package, Some(options.reviewed_commits))?;
 
         if !dependency_plan.provider_deps.is_empty()
             || !dependency_plan.unknown_deps.is_empty()
@@ -812,7 +1050,13 @@ mod commands {
         let repo_dependency_install =
             install_repo_deps_inner(config, db, package, false, &selected_provider_args)?;
         let build = build_inner(config, db, package)?;
-        let install = install_built_inner(config, db, package, false)?;
+        let install = install_built_inner(
+            config,
+            db,
+            package,
+            false,
+            options.allowed_privileged_packages.contains(package),
+        )?;
         state.completed.push(package.to_owned());
         state.outputs.push(InstallPackageOutput {
             package: package.to_owned(),
@@ -847,7 +1091,12 @@ mod commands {
         Ok(plan)
     }
 
-    fn require_reviewed_package(config: &Config, db: &Database, package: &str) -> Result<()> {
+    fn require_reviewed_package(
+        config: &Config,
+        db: &Database,
+        package: &str,
+        grants: Option<&[ReviewedCommitGrant]>,
+    ) -> Result<String> {
         let user = exec::lookup_build_user(&config.build_user)?;
         let path = package_path(config, db, package)?;
         let current_commit = git_head(&user, &path)?
@@ -855,15 +1104,40 @@ mod commands {
         let record = db
             .get_package(package)?
             .ok_or_else(|| anyhow::anyhow!("{package} is missing from state"))?;
-        if record.reviewed_commit.as_deref() != Some(current_commit.as_str()) {
+        let persistently_reviewed =
+            record.reviewed_commit.as_deref() == Some(current_commit.as_str());
+        let exactly_granted = grants.is_some_and(|grants| {
+            grants.iter().any(|grant| {
+                grant.package == package && grant.commit.eq_ignore_ascii_case(&current_commit)
+            })
+        });
+        if !persistently_reviewed && !exactly_granted {
             bail!(
-                "{} fetched and dependency-classified; run `aur-step review {}` after reviewing {} or rerun install with --assume-reviewed",
+                "{} fetched and dependency-classified; run `aur-step review {}` after reviewing {} or pass --reviewed-commit {}={}",
                 package,
                 package,
-                path.join("PKGBUILD")
+                path.join("PKGBUILD"),
+                package,
+                current_commit
             );
         }
-        Ok(())
+        let trust = db.get_trust(package)?;
+        if trust.as_ref().is_some_and(maintainer_changed) {
+            bail!("{package} has an unapproved AUR maintainer transition; inspect and review it explicitly");
+        }
+        if exactly_granted && !persistently_reviewed {
+            let committed_srcinfo = validate_committed_srcinfo(&user, &path)?;
+            let mut findings =
+                security::source_findings(&committed_srcinfo, &git_repository_files(&user, &path)?);
+            let current_sources = security::source_values(&committed_srcinfo);
+            add_trust_findings(&mut findings, trust.as_ref(), Some(&current_sources));
+            if !findings.is_empty() {
+                bail!(
+                    "{package} has high-risk source findings; one-run commit grants cannot approve them, use `aur-step review --allow-high-risk {package}`"
+                );
+            }
+        }
+        Ok(current_commit)
     }
 
     pub fn upgrade(
@@ -872,9 +1146,11 @@ mod commands {
         plan: bool,
         refresh: bool,
         provider_selection_args: &[String],
+        allow_privileged_file_args: &[String],
         json: bool,
     ) -> Result<()> {
         let provider_selections = parse_provider_selections(provider_selection_args)?;
+        let allowed_privileged_packages = parse_package_grants(allow_privileged_file_args)?;
         let build_user = exec::lookup_build_user(&config.build_user)?;
         if refresh || !plan {
             exec::require_root()?;
@@ -943,7 +1219,7 @@ mod commands {
                     build_blocked_count,
                     packages: package_plans,
                     note: if refresh {
-                        "metadata refresh plan from aur-step state, pacman -Qm, git pull --ff-only, and refreshed .SRCINFO files"
+                        "metadata refresh plan from aur-step state, pacman -Qm, git pull --ff-only, and committed .SRCINFO files"
                     } else {
                         "read-only plan from aur-step state, pacman -Qm, and existing .SRCINFO files"
                     },
@@ -952,11 +1228,14 @@ mod commands {
         } else {
             let mut executed = Vec::new();
             for package_plan in package_plans {
+                let allow_privileged_files =
+                    allowed_privileged_packages.contains(&package_plan.package);
                 executed.push(execute_upgrade_package(
                     config,
                     db,
                     package_plan,
                     &provider_selections,
+                    allow_privileged_files,
                 ));
             }
             let completed_count = executed
@@ -1009,6 +1288,7 @@ mod commands {
         db: &Database,
         plan: UpgradePackageOutput,
         provider_selections: &[ProviderSelection],
+        allow_privileged_files: bool,
     ) -> UpgradeRunPackageOutput {
         let mut output = UpgradeRunPackageOutput {
             package: plan.package.clone(),
@@ -1065,14 +1345,15 @@ mod commands {
         };
         output.build = Some(build);
 
-        let install = match install_built_inner(config, db, &plan.package, false) {
-            Ok(install) => install,
-            Err(error) => {
-                output.result = "failed";
-                output.error = Some(error.to_string());
-                return output;
-            }
-        };
+        let install =
+            match install_built_inner(config, db, &plan.package, false, allow_privileged_files) {
+                Ok(install) => install,
+                Err(error) => {
+                    output.result = "failed";
+                    output.error = Some(error.to_string());
+                    return output;
+                }
+            };
         output.install = Some(install);
         output.result = "completed";
         output
@@ -1242,7 +1523,7 @@ mod commands {
             stdout_file: Some(&build_path.join(".aur-step-refresh.log")),
             stderr_file: Some(&build_path.join(".aur-step-refresh.log")),
         })?;
-        refresh_srcinfo_from_pkgbuild(user, build_path)?;
+        validate_committed_srcinfo(user, build_path)?;
         Ok(())
     }
 
@@ -1354,6 +1635,39 @@ mod commands {
             });
         }
         Ok(selections)
+    }
+
+    fn parse_reviewed_commit_grants(args: &[String]) -> Result<Vec<ReviewedCommitGrant>> {
+        let mut grants = Vec::new();
+        let mut seen = BTreeSet::new();
+        for value in args {
+            let Some((package, commit)) = value.split_once('=') else {
+                bail!("invalid reviewed commit {value:?}; expected PACKAGE=COMMIT");
+            };
+            validate_package_name(package)?;
+            if !(40..=64).contains(&commit.len())
+                || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!("invalid commit in reviewed grant {value:?}; expected a full hex object ID");
+            }
+            if !seen.insert(package.to_owned()) {
+                bail!("duplicate reviewed commit grant for {package}");
+            }
+            grants.push(ReviewedCommitGrant {
+                package: package.to_owned(),
+                commit: commit.to_owned(),
+            });
+        }
+        Ok(grants)
+    }
+
+    fn parse_package_grants(args: &[String]) -> Result<BTreeSet<String>> {
+        let mut packages = BTreeSet::new();
+        for package in args {
+            validate_package_name(package)?;
+            packages.insert(package.to_owned());
+        }
+        Ok(packages)
     }
 
     fn apply_provider_selections(
@@ -1693,27 +2007,259 @@ mod commands {
         Ok(config.package_dir(package))
     }
 
-    fn refresh_srcinfo(
-        _config: &Config,
+    fn validate_committed_srcinfo(
         user: &exec::BuildUser,
         package_dir: &Utf8Path,
-    ) -> Result<()> {
-        refresh_srcinfo_from_pkgbuild(user, package_dir)
-    }
-
-    fn refresh_srcinfo_from_pkgbuild(user: &exec::BuildUser, package_dir: &Utf8Path) -> Result<()> {
+    ) -> Result<String> {
         if !package_dir.join("PKGBUILD").exists() {
             bail!("{package_dir} does not contain PKGBUILD");
         }
+        let committed = git_output(user, package_dir, &["show", "HEAD:.SRCINFO"])
+            .with_context(|| {
+                format!(
+                    "{package_dir} has no committed .SRCINFO; refusing to evaluate PKGBUILD before review"
+                )
+            })?;
+        let working_path = package_dir.join(".SRCINFO");
+        let working = fs::read_to_string(&working_path)
+            .with_context(|| format!("failed to read committed metadata copy {working_path}"))?;
+        if normalize_srcinfo(&working) != normalize_srcinfo(&committed) {
+            bail!(
+                "{} differs from HEAD:.SRCINFO; restore or review the tracked metadata before continuing",
+                working_path
+            );
+        }
+        Ok(committed)
+    }
+
+    fn validate_generated_srcinfo(
+        config: &Config,
+        user: &exec::BuildUser,
+        package_dir: &Utf8Path,
+    ) -> Result<()> {
+        let committed = validate_committed_srcinfo(user, package_dir)?;
+        let generated = run_makepkg_capture(
+            config,
+            user,
+            package_dir,
+            vec!["--printsrcinfo".to_owned()],
+            false,
+        )?;
+        if normalize_srcinfo(&generated) != normalize_srcinfo(&committed) {
+            bail!(
+                "generated .SRCINFO does not match committed HEAD:.SRCINFO in {package_dir}; update and review .SRCINFO before building"
+            );
+        }
+        Ok(())
+    }
+
+    fn normalize_srcinfo(value: &str) -> String {
+        value
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_owned()
+    }
+
+    fn git_repository_files(user: &exec::BuildUser, path: &Utf8Path) -> Result<Vec<String>> {
+        let output = git_output(user, path, &["ls-tree", "-r", "--name-only", "HEAD"])?;
+        Ok(output.lines().map(ToOwned::to_owned).collect())
+    }
+
+    fn run_makepkg(
+        config: &Config,
+        user: &exec::BuildUser,
+        package_dir: &Utf8Path,
+        args: Vec<String>,
+        allow_network: bool,
+        log: &Utf8Path,
+    ) -> Result<()> {
+        exec::ensure_private_user_owned_dir(&config.sandbox_home, user)?;
+        let (program, args) = sandboxed_command(config, package_dir, args, allow_network)?;
         exec::run_as_user(exec::UserCommand {
             user,
-            program: "makepkg",
-            args: vec!["--printsrcinfo".to_owned()],
+            program,
+            args,
             cwd: package_dir,
-            stdout_file: Some(&package_dir.join(".SRCINFO")),
-            stderr_file: Some(&package_dir.join(".aur-step-srcinfo.log")),
+            stdout_file: Some(log),
+            stderr_file: Some(log),
         })?;
         Ok(())
+    }
+
+    fn run_makepkg_capture(
+        config: &Config,
+        user: &exec::BuildUser,
+        package_dir: &Utf8Path,
+        args: Vec<String>,
+        allow_network: bool,
+    ) -> Result<String> {
+        exec::ensure_private_user_owned_dir(&config.sandbox_home, user)?;
+        let (program, args) = sandboxed_command(config, package_dir, args, allow_network)?;
+        exec::run_as_user_capture(user, program, args, package_dir)
+    }
+
+    fn sandboxed_command(
+        config: &Config,
+        package_dir: &Utf8Path,
+        makepkg_args: Vec<String>,
+        allow_network: bool,
+    ) -> Result<(&'static str, Vec<String>)> {
+        if !config.sandbox_builds {
+            return Ok(("makepkg", makepkg_args));
+        }
+        if !Utf8Path::new("/usr/bin/bwrap").exists() {
+            bail!("sandbox_builds=true but /usr/bin/bwrap is unavailable");
+        }
+        let mut args = vec![
+            "--unshare-all".to_owned(),
+            "--die-with-parent".to_owned(),
+            "--new-session".to_owned(),
+        ];
+        if allow_network {
+            args.push("--share-net".to_owned());
+        }
+        args.extend([
+            "--proc".to_owned(),
+            "/proc".to_owned(),
+            "--dev".to_owned(),
+            "/dev".to_owned(),
+            "--tmpfs".to_owned(),
+            "/tmp".to_owned(),
+            "--ro-bind".to_owned(),
+            "/usr".to_owned(),
+            "/usr".to_owned(),
+            "--symlink".to_owned(),
+            "usr/bin".to_owned(),
+            "/bin".to_owned(),
+            "--symlink".to_owned(),
+            "usr/bin".to_owned(),
+            "/sbin".to_owned(),
+            "--symlink".to_owned(),
+            "usr/lib".to_owned(),
+            "/lib".to_owned(),
+            "--symlink".to_owned(),
+            "usr/lib".to_owned(),
+            "/lib64".to_owned(),
+            "--ro-bind".to_owned(),
+            "/etc".to_owned(),
+            "/etc".to_owned(),
+            "--dir".to_owned(),
+            "/var".to_owned(),
+            "--dir".to_owned(),
+            "/var/lib".to_owned(),
+            "--ro-bind".to_owned(),
+            "/var/lib/pacman".to_owned(),
+            "/var/lib/pacman".to_owned(),
+            "--dir".to_owned(),
+            "/var/cache".to_owned(),
+            "--ro-bind".to_owned(),
+            "/var/cache/pacman".to_owned(),
+            "/var/cache/pacman".to_owned(),
+            "--dir".to_owned(),
+            "/home".to_owned(),
+            "--bind".to_owned(),
+            config.sandbox_home.to_string(),
+            "/home/build".to_owned(),
+            "--bind".to_owned(),
+            package_dir.to_string(),
+            "/build".to_owned(),
+            "--tmpfs".to_owned(),
+            "/build/.git".to_owned(),
+            "--setenv".to_owned(),
+            "HOME".to_owned(),
+            "/home/build".to_owned(),
+            "--setenv".to_owned(),
+            "PATH".to_owned(),
+            "/usr/local/bin:/usr/bin:/bin".to_owned(),
+            "--chdir".to_owned(),
+            "/build".to_owned(),
+            "/usr/bin/makepkg".to_owned(),
+        ]);
+        args.extend(makepkg_args);
+        Ok(("bwrap", args))
+    }
+
+    fn fetch_aur_maintainer(
+        config: &Config,
+        user: &exec::BuildUser,
+        package_dir: &Utf8Path,
+        package: &str,
+    ) -> Result<Option<Option<String>>> {
+        if config.aur_url.starts_with("file://") {
+            return Ok(None);
+        }
+        let url = format!(
+            "{}/rpc/v5/info?arg[]={}",
+            config.aur_url.trim_end_matches('/'),
+            percent_encode(package)
+        );
+        let body = exec::run_as_user_capture(
+            user,
+            "curl",
+            vec![
+                "--fail".to_owned(),
+                "--globoff".to_owned(),
+                "--silent".to_owned(),
+                "--show-error".to_owned(),
+                "--max-time".to_owned(),
+                "15".to_owned(),
+                url,
+            ],
+            package_dir,
+        )
+        .context("failed to query AUR package metadata")?;
+        let response: AurRpcResponse =
+            serde_json::from_str(&body).context("failed to parse AUR RPC response")?;
+        if response.result_count != 1 || response.results.len() != 1 {
+            bail!("AUR RPC returned no unique package metadata for {package}");
+        }
+        Ok(Some(
+            response.results.into_iter().next().unwrap().maintainer,
+        ))
+    }
+
+    fn percent_encode(value: &str) -> String {
+        value
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                    char::from(byte).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect()
+    }
+
+    fn maintainer_changed(trust: &crate::model::TrustRecord) -> bool {
+        trust.reviewed_at.is_some() && trust.reviewed_maintainer != trust.observed_maintainer
+    }
+
+    fn add_trust_findings(
+        findings: &mut Vec<security::SecurityFinding>,
+        trust: Option<&crate::model::TrustRecord>,
+        current_sources: Option<&[String]>,
+    ) {
+        let Some(trust) = trust.filter(|trust| trust.reviewed_at.is_some()) else {
+            return;
+        };
+        let observed_sources = current_sources.unwrap_or(&trust.observed_sources);
+        if trust.reviewed_sources != observed_sources {
+            findings.push(security::SecurityFinding {
+                code: "source_set_changed",
+                detail: format!(
+                    "reviewed sources {:?} changed to {:?}",
+                    trust.reviewed_sources, observed_sources
+                ),
+            });
+        }
+        findings.sort_by(|left, right| {
+            (left.code, left.detail.as_str()).cmp(&(right.code, right.detail.as_str()))
+        });
+        findings.dedup();
     }
 
     fn package_artifacts(
@@ -1854,6 +2400,9 @@ mod commands {
         repo_url: String,
         path: Utf8PathBuf,
         last_commit: Option<String>,
+        observed_maintainer: Option<String>,
+        maintainer_changed: bool,
+        srcinfo_source: &'static str,
     }
 
     #[derive(Serialize)]
@@ -1867,7 +2416,18 @@ mod commands {
         last_commit: Option<String>,
         reviewed: bool,
         review_diff: Option<ReviewDiffOutput>,
+        security_findings: Vec<security::SecurityFinding>,
+        trust: Option<crate::model::TrustRecord>,
+        maintainer_changed: bool,
         state_record: Option<crate::model::PackageRecord>,
+    }
+
+    #[derive(Serialize)]
+    struct AuditOutput {
+        package: crate::model::PackageRecord,
+        trust: Option<crate::model::TrustRecord>,
+        artifacts: Vec<crate::model::ArtifactRecord>,
+        journal: Vec<crate::model::JournalRecord>,
     }
 
     #[derive(Serialize)]
@@ -1913,6 +2473,8 @@ mod commands {
         package: &'a str,
         path: Utf8PathBuf,
         reviewed_commit: String,
+        security_findings: Vec<security::SecurityFinding>,
+        maintainer_change_approved: bool,
     }
 
     #[derive(Serialize)]
@@ -1943,6 +2505,15 @@ mod commands {
         path: Utf8PathBuf,
         version: Option<String>,
         artifacts: Vec<Utf8PathBuf>,
+        artifact_audits: Vec<ArtifactAuditOutput>,
+        sandboxed: bool,
+        build_network: bool,
+    }
+
+    #[derive(Serialize)]
+    struct ArtifactAuditOutput {
+        path: Utf8PathBuf,
+        audit: security::ArtifactAudit,
     }
 
     #[derive(Serialize)]
@@ -1953,6 +2524,8 @@ mod commands {
         version: Option<String>,
         pacman_args: Vec<String>,
         artifacts: Vec<Utf8PathBuf>,
+        artifact_audits: Vec<ArtifactAuditOutput>,
+        allow_privileged_files: bool,
     }
 
     #[derive(Serialize)]
@@ -1984,7 +2557,8 @@ mod commands {
 
     #[derive(Clone, Copy)]
     struct InstallOptions<'a> {
-        assume_reviewed: bool,
+        reviewed_commits: &'a [ReviewedCommitGrant],
+        allowed_privileged_packages: &'a BTreeSet<String>,
         auto_aur_deps: bool,
         provider_selections: &'a [ProviderSelection],
     }
@@ -1995,10 +2569,17 @@ mod commands {
         outputs: Vec<InstallPackageOutput>,
     }
 
+    #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+    struct ReviewedCommitGrant {
+        package: String,
+        commit: String,
+    }
+
     #[derive(Serialize)]
     struct InstallOutput {
         completed: Vec<String>,
-        assume_reviewed: bool,
+        reviewed_commits: Vec<ReviewedCommitGrant>,
+        allowed_privileged_packages: Vec<String>,
         auto_aur_deps: bool,
         packages: Vec<InstallPackageOutput>,
     }
@@ -2101,6 +2682,19 @@ mod commands {
         error: Option<String>,
     }
 
+    #[derive(Deserialize)]
+    struct AurRpcResponse {
+        #[serde(rename = "resultcount")]
+        result_count: usize,
+        results: Vec<AurRpcPackage>,
+    }
+
+    #[derive(Deserialize)]
+    struct AurRpcPackage {
+        #[serde(rename = "Maintainer")]
+        maintainer: Option<String>,
+    }
+
     #[cfg(test)]
     mod tests {
         use crate::{
@@ -2111,8 +2705,8 @@ mod commands {
 
         use super::{
             apply_provider_selections, execute_upgrade_package, is_package_artifact_name,
-            parse_provider_selections, upgrade_build_plan, upgrade_status_from_comparison,
-            validate_package_name, UpgradePackageOutput,
+            parse_provider_selections, parse_reviewed_commit_grants, upgrade_build_plan,
+            upgrade_status_from_comparison, validate_package_name, UpgradePackageOutput,
         };
         use camino::Utf8PathBuf;
 
@@ -2124,6 +2718,16 @@ mod commands {
             assert!(validate_package_name("../bad").is_err());
             assert!(validate_package_name("-bad").is_err());
             assert!(validate_package_name("").is_err());
+        }
+
+        #[test]
+        fn reviewed_commit_grants_require_package_and_full_hash() {
+            let hash = "a".repeat(40);
+            let grants = parse_reviewed_commit_grants(&[format!("example={hash}")]).unwrap();
+            assert_eq!(grants[0].package, "example");
+            assert_eq!(grants[0].commit, hash);
+            assert!(parse_reviewed_commit_grants(&["example=abc".to_owned()]).is_err());
+            assert!(parse_reviewed_commit_grants(&["missing-separator".to_owned()]).is_err());
         }
 
         #[test]
@@ -2183,6 +2787,9 @@ mod commands {
                 state_db: Utf8PathBuf::from_path_buf(temp.path().join("state.sqlite3")).unwrap(),
                 yay_build_dir: Utf8PathBuf::from_path_buf(temp.path().join("yay")).unwrap(),
                 aur_url: "file:///fake".to_owned(),
+                sandbox_builds: false,
+                allow_build_network: false,
+                sandbox_home: Utf8PathBuf::from_path_buf(temp.path().join("build/.home")).unwrap(),
             };
             let db = Database::open(&config).unwrap();
             let package = UpgradePackageOutput {
@@ -2205,7 +2812,7 @@ mod commands {
                 error: None,
             };
 
-            let output = execute_upgrade_package(&config, &db, package, &[]);
+            let output = execute_upgrade_package(&config, &db, package, &[], false);
 
             assert_eq!(output.result, "blocked");
             assert_eq!(output.package, "fake-blocked");
@@ -2227,6 +2834,9 @@ mod commands {
                 state_db: Utf8PathBuf::from_path_buf(temp.path().join("state.sqlite3")).unwrap(),
                 yay_build_dir: Utf8PathBuf::from_path_buf(temp.path().join("yay")).unwrap(),
                 aur_url: "file:///fake".to_owned(),
+                sandbox_builds: false,
+                allow_build_network: false,
+                sandbox_home: Utf8PathBuf::from_path_buf(temp.path().join("build/.home")).unwrap(),
             };
             let db = Database::open(&config).unwrap();
             let package = UpgradePackageOutput {
@@ -2249,7 +2859,7 @@ mod commands {
                 error: None,
             };
 
-            let output = execute_upgrade_package(&config, &db, package, &[]);
+            let output = execute_upgrade_package(&config, &db, package, &[], false);
 
             assert_eq!(output.result, "no_action");
             assert!(output.dependency_install.is_none());
