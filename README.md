@@ -112,6 +112,15 @@ inside bubblewrap with an empty dedicated HOME and no view of the configured
 user's normal home. Source verification receives network access, while the
 actual build is offline unless `allow_build_network=true` is explicitly set.
 
+Network-enabled phases resolve `/etc/resolv.conf` and expose only its target
+file read-only when it lives under `/run` (including systemd-resolved and
+NetworkManager). Host runtime directories and control sockets remain hidden.
+Offline phases do not require or expose that runtime resolver file. Resolver
+targets outside `/etc` and `/run` are rejected with an actionable error.
+The sandbox also sets `FAKEROOTDONTTRYCHOWN=1` so package ownership is simulated
+without attempting real ownership changes to unmapped users. No per-user
+makepkg workaround or sandbox disabling is needed.
+
 Generated package archives are opened without following symlinks, checked for
 build-user ownership and hard links, SHA-256 bound to the reviewed build commit,
 copied into root-owned staging, parsed by `pacman -Qp`, and audited for install

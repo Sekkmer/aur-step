@@ -2133,9 +2133,10 @@ mod commands {
             "--die-with-parent".to_owned(),
             "--new-session".to_owned(),
         ];
-        if allow_network {
-            args.push("--share-net".to_owned());
-        }
+        args.extend(sandbox_network_args(
+            allow_network,
+            Utf8Path::new("/etc/resolv.conf"),
+        )?);
         args.extend([
             "--proc".to_owned(),
             "/proc".to_owned(),
@@ -2189,12 +2190,59 @@ mod commands {
             "--setenv".to_owned(),
             "PATH".to_owned(),
             "/usr/local/bin:/usr/bin:/bin".to_owned(),
+            // fakeroot otherwise tries real chown to unmapped UID 0, which
+            // fails with EINVAL inside bubblewrap's single-user namespace.
+            "--setenv".to_owned(),
+            "FAKEROOTDONTTRYCHOWN".to_owned(),
+            "1".to_owned(),
             "--chdir".to_owned(),
             "/build".to_owned(),
             "/usr/bin/makepkg".to_owned(),
         ]);
         args.extend(makepkg_args);
         Ok(("bwrap", args))
+    }
+
+    fn resolve_resolver_file(path: &Utf8Path) -> Result<Utf8PathBuf> {
+        let target = std::fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve DNS configuration {path}"))?;
+        if !std::fs::metadata(&target)?.is_file() {
+            bail!("DNS configuration {path} must resolve to a regular file");
+        }
+        Utf8PathBuf::from_path_buf(target)
+            .map_err(|path| anyhow::anyhow!("DNS configuration path is not UTF-8: {path:?}"))
+    }
+
+    fn resolver_mount_args(target: &Utf8Path) -> Result<Vec<String>> {
+        // /etc is already visible read-only. systemd-resolved, NetworkManager
+        // and resolvconf commonly put the actual file under /run instead.
+        // Bind only that file at the symlink's canonical destination: exposing
+        // all of /run would leak host service/agent sockets into AUR builds.
+        if target.starts_with("/etc") {
+            return Ok(Vec::new());
+        }
+        if !target.starts_with("/run") {
+            bail!(
+                "unsupported DNS configuration target {target}; expected a file under /etc or /run"
+            );
+        }
+        Ok(vec![
+            "--ro-bind".to_owned(),
+            target.to_string(),
+            target.to_string(),
+        ])
+    }
+
+    fn sandbox_network_args(allow_network: bool, resolver: &Utf8Path) -> Result<Vec<String>> {
+        if !allow_network {
+            // Offline phases neither need resolver configuration nor gain
+            // access to any of the host's runtime files or network namespace.
+            return Ok(Vec::new());
+        }
+        let target = resolve_resolver_file(resolver)?;
+        let mut args = vec!["--share-net".to_owned()];
+        args.extend(resolver_mount_args(&target)?);
+        Ok(args)
     }
 
     fn fetch_aur_maintainer(
@@ -2763,10 +2811,98 @@ mod commands {
         use super::{
             apply_provider_selections, execute_upgrade_package, is_current_package_artifact_name,
             is_package_artifact_name, normalize_srcinfo, parse_provider_selections,
-            parse_reviewed_commit_grants, trust_baseline_missing, upgrade_build_plan,
+            parse_reviewed_commit_grants, resolve_resolver_file, resolver_mount_args,
+            sandbox_network_args, sandboxed_command, trust_baseline_missing, upgrade_build_plan,
             upgrade_status_from_comparison, validate_package_name, UpgradePackageOutput,
         };
-        use camino::Utf8PathBuf;
+        use camino::{Utf8Path, Utf8PathBuf};
+
+        #[test]
+        fn resolver_mount_exposes_only_the_runtime_file_read_only() {
+            for target in [
+                "/run/systemd/resolve/stub-resolv.conf",
+                "/run/systemd/resolve/resolv.conf",
+                "/run/NetworkManager/resolv.conf",
+                "/run/resolvconf/resolv.conf",
+            ] {
+                assert_eq!(
+                    resolver_mount_args(Utf8Path::new(target)).unwrap(),
+                    ["--ro-bind", target, target]
+                );
+            }
+            assert!(resolver_mount_args(Utf8Path::new("/etc/resolv.conf"))
+                .unwrap()
+                .is_empty());
+            assert!(
+                resolver_mount_args(Utf8Path::new("/etc/resolvconf/resolv.conf"))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(resolver_mount_args(Utf8Path::new("/home/build/resolv.conf")).is_err());
+            assert!(resolver_mount_args(Utf8Path::new("/run-other/resolv.conf")).is_err());
+        }
+
+        #[test]
+        fn resolver_resolution_follows_relative_symlink_chains() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(temp.path()).unwrap();
+            let target = root.join("actual.conf");
+            std::fs::write(&target, "nameserver 127.0.0.53\n").unwrap();
+            std::os::unix::fs::symlink("actual.conf", root.join("middle.conf")).unwrap();
+            std::os::unix::fs::symlink("middle.conf", root.join("resolv.conf")).unwrap();
+            assert_eq!(
+                resolve_resolver_file(&root.join("resolv.conf")).unwrap(),
+                target
+            );
+            assert_eq!(resolve_resolver_file(&target).unwrap(), target);
+        }
+
+        #[test]
+        fn resolver_resolution_rejects_missing_targets_and_directories() {
+            let temp = tempfile::tempdir().unwrap();
+            let root = Utf8Path::from_path(temp.path()).unwrap();
+            std::os::unix::fs::symlink("missing.conf", root.join("resolv.conf")).unwrap();
+            assert!(resolve_resolver_file(&root.join("resolv.conf")).is_err());
+            assert!(resolve_resolver_file(root).is_err());
+        }
+
+        #[test]
+        fn offline_sandbox_does_not_require_or_expose_a_resolver() {
+            let temp = tempfile::tempdir().unwrap();
+            let resolver = Utf8Path::from_path(temp.path())
+                .unwrap()
+                .join("missing.conf");
+            assert!(sandbox_network_args(false, &resolver).unwrap().is_empty());
+            assert!(sandbox_network_args(true, &resolver).is_err());
+        }
+
+        #[test]
+        fn sandbox_enables_fake_ownership_without_sharing_offline_network() {
+            let config = Config {
+                build_user: "nobody".to_owned(),
+                build_root: "/build-root".into(),
+                state_db: "/state.sqlite3".into(),
+                yay_build_dir: "/yay".into(),
+                aur_url: "file:///fake".to_owned(),
+                sandbox_builds: true,
+                allow_build_network: false,
+                sandbox_home: "/build-root/.home".into(),
+            };
+            let (program, args) = sandboxed_command(
+                &config,
+                Utf8Path::new("/build-root/test"),
+                vec!["--force".to_owned()],
+                false,
+            )
+            .unwrap();
+            assert_eq!(program, "bwrap");
+            assert!(args.contains(&"--unshare-all".to_owned()));
+            assert!(!args.contains(&"--share-net".to_owned()));
+            assert!(args
+                .windows(3)
+                .any(|window| window == ["--setenv", "FAKEROOTDONTTRYCHOWN", "1"]));
+            assert!(!args.iter().any(|arg| arg.starts_with("/run")));
+        }
 
         #[test]
         fn validates_arch_package_name_subset() {
