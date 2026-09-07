@@ -75,6 +75,9 @@ cargo build --release --locked
 sudo install -o root -g root -m 0755 target/release/aur-step /usr/local/bin/aur-step
 ```
 
+For prebuilt static x86_64 binaries and an optional daily updater that verifies
+Sekkmer's GPG signatures, see [signed releases](docs/releases.md).
+
 Install a root-owned configuration at `/etc/aur-step.toml`:
 
 ```toml

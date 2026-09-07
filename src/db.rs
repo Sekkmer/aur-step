@@ -369,7 +369,7 @@ impl Database {
                 action,
                 commit,
                 details: serde_json::from_str(&details)
-                    .unwrap_or_else(|_| serde_json::Value::String(details)),
+                    .unwrap_or(serde_json::Value::String(details)),
                 created_at,
             })
         })

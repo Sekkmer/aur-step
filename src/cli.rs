@@ -2,7 +2,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "aur-step")]
+#[command(name = "aur-step", version)]
 #[command(about = "Root-supervised, user-built AUR orchestration primitive")]
 #[command(
     long_about = "Root-supervised, user-built AUR orchestration for AI agents.\n\nAUR-controlled code runs as the configured build user. Root is used only for pacman operations and trusted state management.",

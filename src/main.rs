@@ -684,7 +684,11 @@ mod commands {
             config,
             &user,
             &path,
-            vec!["--verifysource".to_owned(), "--noconfirm".to_owned()],
+            vec![
+                "--verifysource".to_owned(),
+                "--noconfirm".to_owned(),
+                "--force".to_owned(),
+            ],
             true,
             &path.join(".aur-step-source.log"),
         )?;
@@ -692,11 +696,12 @@ mod commands {
             config,
             &user,
             &path,
-            vec!["--noconfirm".to_owned()],
+            vec!["--noconfirm".to_owned(), "--force".to_owned()],
             config.allow_build_network,
             &path.join(".aur-step-makepkg.log"),
         )?;
-        let artifacts = package_artifacts(&path, &user)?;
+        let srcinfo = srcinfo::parse_file(&path.join(".SRCINFO"))?;
+        let artifacts = current_package_artifacts(&path, &user, &srcinfo)?;
         let mut artifact_audits = Vec::new();
         let mut artifact_records = Vec::new();
         for artifact in &artifacts {
@@ -713,7 +718,7 @@ mod commands {
             });
         }
         db.replace_build_artifacts(package, &artifact_records)?;
-        let version = srcinfo::parse_file(&path.join(".SRCINFO"))?.version();
+        let version = srcinfo.version();
         db.update_last_built_version(package, version.as_deref())?;
         db.journal(
             "build",
@@ -762,7 +767,8 @@ mod commands {
         validate_package_name(package)?;
         let user = exec::lookup_build_user(&config.build_user)?;
         let path = package_path(config, db, package)?;
-        let artifacts = package_artifacts(&path, &user)?;
+        let srcinfo = srcinfo::parse_file(&path.join(".SRCINFO"))?;
+        let artifacts = current_package_artifacts(&path, &user, &srcinfo)?;
         if artifacts.is_empty() {
             bail!("no package artifacts found in {path}; run aur-step build {package} first");
         }
@@ -841,9 +847,7 @@ mod commands {
                 }),
             )?;
         }
-        let version = srcinfo::parse_file(&path.join(".SRCINFO"))
-            .ok()
-            .and_then(|info| info.version());
+        let version = srcinfo.version();
         if !plan_only {
             db.update_last_installed_version(package, version.as_deref())?;
         }
@@ -947,6 +951,7 @@ mod commands {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn install(
         config: &Config,
         db: &Database,
@@ -2061,6 +2066,11 @@ mod commands {
     fn normalize_srcinfo(value: &str) -> String {
         value
             .lines()
+            // makepkg --printsrcinfo emits only machine-readable metadata.
+            // AUR repositories may retain maintainer or license comments in
+            // the committed copy; those comments do not change package
+            // semantics and must not make generated metadata fail validation.
+            .filter(|line| !line.trim_start().starts_with('#'))
             .map(str::trim_end)
             .collect::<Vec<_>>()
             .join("\n")
@@ -2301,6 +2311,33 @@ mod commands {
         Ok(artifacts)
     }
 
+    fn current_package_artifacts(
+        package_dir: &Utf8Path,
+        user: &exec::BuildUser,
+        srcinfo: &crate::model::SrcInfo,
+    ) -> Result<Vec<Utf8PathBuf>> {
+        let version = srcinfo
+            .version()
+            .ok_or_else(|| anyhow::anyhow!(".SRCINFO in {package_dir} has no package version"))?;
+        if srcinfo.pkgname.is_empty() {
+            bail!(".SRCINFO in {package_dir} has no package names");
+        }
+        let artifacts = package_artifacts(package_dir, user)?
+            .into_iter()
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    is_current_package_artifact_name(name, &srcinfo.pkgname, &version)
+                })
+            })
+            .collect::<Vec<_>>();
+        if artifacts.is_empty() {
+            bail!(
+                "no package artifacts for version {version} found in {package_dir}; run aur-step build first"
+            );
+        }
+        Ok(artifacts)
+    }
+
     fn validate_artifact_file(file: &File, path: &Utf8Path, user: &exec::BuildUser) -> Result<()> {
         let metadata = file
             .metadata()
@@ -2387,6 +2424,17 @@ mod commands {
                 || name.ends_with(".pkg.tar.bz2")
                 || name.ends_with(".pkg.tar.lz4")
                 || name.ends_with(".pkg.tar.lzo"))
+    }
+
+    fn is_current_package_artifact_name(
+        name: &str,
+        package_names: &[String],
+        version: &str,
+    ) -> bool {
+        is_package_artifact_name(name)
+            && package_names
+                .iter()
+                .any(|package| name.starts_with(&format!("{package}-{version}-")))
     }
 
     #[derive(Serialize)]
@@ -2713,10 +2761,10 @@ mod commands {
         };
 
         use super::{
-            apply_provider_selections, execute_upgrade_package, is_package_artifact_name,
-            parse_provider_selections, parse_reviewed_commit_grants, trust_baseline_missing,
-            upgrade_build_plan, upgrade_status_from_comparison, validate_package_name,
-            UpgradePackageOutput,
+            apply_provider_selections, execute_upgrade_package, is_current_package_artifact_name,
+            is_package_artifact_name, normalize_srcinfo, parse_provider_selections,
+            parse_reviewed_commit_grants, trust_baseline_missing, upgrade_build_plan,
+            upgrade_status_from_comparison, validate_package_name, UpgradePackageOutput,
         };
         use camino::Utf8PathBuf;
 
@@ -2728,6 +2776,14 @@ mod commands {
             assert!(validate_package_name("../bad").is_err());
             assert!(validate_package_name("-bad").is_err());
             assert!(validate_package_name("").is_err());
+        }
+
+        #[test]
+        fn srcinfo_normalization_ignores_comment_only_headers() {
+            let committed = "# Maintainer: Example\n# SPDX-License-Identifier: 0BSD\npkgbase = example\n\tpkgver = 1\n";
+            let generated = "pkgbase = example\n\tpkgver = 1\n";
+
+            assert_eq!(normalize_srcinfo(committed), normalize_srcinfo(generated));
         }
 
         #[test]
@@ -2765,6 +2821,31 @@ mod commands {
             assert!(is_package_artifact_name("foo-1-1-any.pkg.tar"));
             assert!(!is_package_artifact_name("foo-1-1-any.pkg.tar.zst.sig"));
             assert!(!is_package_artifact_name("foo.zip"));
+        }
+
+        #[test]
+        fn current_artifact_selection_excludes_historical_versions_and_keeps_split_packages() {
+            let packages = vec!["example".to_owned(), "example-tools".to_owned()];
+            assert!(is_current_package_artifact_name(
+                "example-2.0.0-1-x86_64.pkg.tar.zst",
+                &packages,
+                "2.0.0-1"
+            ));
+            assert!(is_current_package_artifact_name(
+                "example-tools-2.0.0-1-any.pkg.tar.zst",
+                &packages,
+                "2.0.0-1"
+            ));
+            assert!(!is_current_package_artifact_name(
+                "example-1.9.0-1-x86_64.pkg.tar.zst",
+                &packages,
+                "2.0.0-1"
+            ));
+            assert!(!is_current_package_artifact_name(
+                "unrelated-2.0.0-1-x86_64.pkg.tar.zst",
+                &packages,
+                "2.0.0-1"
+            ));
         }
 
         #[test]

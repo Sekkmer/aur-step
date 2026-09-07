@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Update only the aur-step executable; AUR package reviews and upgrades are separate.
+set -euo pipefail
+export PATH=/usr/bin:/bin
+
+readonly release_repo=Sekkmer/aur-step
+readonly release_target=x86_64-unknown-linux-musl
+readonly release_signer=BFBC402DFF513BC806F63409BA6C5BE10CF2708B
+
+fail() { printf 'aur-step-update: %s\n' "$*" >&2; return 1; }
+
+valid_tag() { [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+fetch() {
+  local url=$1 output=$2 accept=$3
+  local -a headers=(-H "Accept: $accept")
+  if [[ -f /etc/aur-step-release.headers ]]; then
+    [[ ! -L /etc/aur-step-release.headers ]] || fail 'Credential file must not be a symlink.'
+    [[ $(stat -c %u /etc/aur-step-release.headers) == 0 && $(stat -c %a /etc/aur-step-release.headers) == 600 ]] ||
+      fail 'Credential file must be root-owned with mode 0600.'
+    headers+=(-H @/etc/aur-step-release.headers)
+  fi
+  curl -q --fail --silent --show-error --location --retry 3 \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 15 --max-time 180 --max-filesize 67108864 \
+    "${headers[@]}" --output "$output" --url "$url"
+}
+
+fetch_asset() {
+  local metadata=$1 name=$2 destination=$3 url
+  url=$(jq -er --arg name "$name" \
+    '[.assets[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].url else error("missing or duplicate release asset") end' "$metadata")
+  [[ $url =~ ^https://api\.github\.com/repos/Sekkmer/aur-step/releases/assets/[0-9]+$ ]] ||
+    fail 'Unexpected release asset URL.'
+  fetch "$url" "$destination" application/octet-stream
+}
+
+verify_release() {
+  local directory=$1 archive=$2 key=$3 expected actual
+  mkdir -m 700 "$directory/gnupg"
+  gpg --batch --homedir "$directory/gnupg" --dearmor \
+    --output "$directory/release-key.gpg" "$key"
+  gpgv --homedir "$directory/gnupg" --status-fd 1 \
+    --keyring "$directory/release-key.gpg" \
+    "$directory/SHA256SUMS.asc" "$directory/SHA256SUMS" > "$directory/signature-status"
+  grep -q "^\[GNUPG:\] VALIDSIG $release_signer " "$directory/signature-status" ||
+    fail 'Checksum signature is not from the pinned Sekkmer signing key.'
+  if grep -Eq '^\[GNUPG:\] (EXPKEYSIG|EXPSIG|REVKEYSIG|BADSIG) ' "$directory/signature-status"; then
+    fail 'Expired, revoked, or invalid release signature.'
+  fi
+  expected=$(awk -v name="$archive" '$2 == name { count++; hash=$1 } END { if (count != 1) exit 1; print hash }' "$directory/SHA256SUMS")
+  [[ $expected =~ ^[[:xdigit:]]{64}$ ]] || fail 'Invalid archive checksum.'
+  actual=$(sha256sum "$directory/$archive")
+  [[ ${actual%% *} == "$expected" ]] || fail 'Release archive checksum mismatch.'
+}
+
+main() (
+  local check=false stage='' replacement='' tag version archive current=0.0.0
+  case ${1:-} in
+    --check) check=true; shift ;;
+    --help|-h)
+      echo 'Usage: aur-step-update [--check]'
+      echo 'Install the latest stable, GPG-verified release from Sekkmer/aur-step.'
+      return 0 ;;
+    '') ;;
+    *) fail 'Unknown argument. Use --help.' ;;
+  esac
+  [[ $# == 0 ]] || fail 'Unexpected arguments.'
+  [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'Only Linux x86_64 is supported.'
+  if ! $check; then
+    [[ $EUID == 0 ]] || fail 'Run as root to install an update.'
+    [[ ! -L /run/aur-step-update ]] || fail 'Lock directory must not be a symlink.'
+    install -d -m 700 -o root -g root /run/aur-step-update
+    exec 9>/run/aur-step-update/lock
+    flock -n 9 || { echo 'Another aur-step update is running.'; return 0; }
+  fi
+  stage=$(mktemp -d /tmp/aur-step-update.XXXXXXXX)
+  trap '[[ -z $replacement ]] || rm -f -- "$replacement"; rm -rf -- "$stage"' EXIT
+  fetch "https://api.github.com/repos/$release_repo/releases/latest" "$stage/release.json" application/vnd.github+json
+  tag=$(jq -er 'select(.draft == false and .prerelease == false) | .tag_name' "$stage/release.json")
+  valid_tag "$tag" || fail 'Release tag must have the form vMAJOR.MINOR.PATCH.'
+  version=${tag#v}
+  if [[ -e /usr/local/bin/aur-step || -L /usr/local/bin/aur-step ]]; then
+    [[ ! -L /usr/local/bin/aur-step ]] || fail 'Installed executable must not be a symlink.'
+    current=$(/usr/local/bin/aur-step --version)
+    current=${current#aur-step }
+    valid_tag "v$current" || fail 'Cannot determine the installed version.'
+  fi
+  if (( $(vercmp "$version" "$current") <= 0 )); then
+    printf 'aur-step %s is current (latest release: %s).\n' "$current" "$tag"
+    return 0
+  fi
+  printf 'aur-step update available: %s -> %s\n' "$current" "$version"
+  $check && return 0
+  local key=/usr/local/share/aur-step/release-signing-key.asc
+  [[ -f $key && ! -L $key && $(stat -c %u "$key") == 0 ]] || fail 'Missing root-owned release signing key.'
+  archive="aur-step-$tag-$release_target.tar.gz"
+  fetch_asset "$stage/release.json" SHA256SUMS "$stage/SHA256SUMS"
+  fetch_asset "$stage/release.json" SHA256SUMS.asc "$stage/SHA256SUMS.asc"
+  fetch_asset "$stage/release.json" "$archive" "$stage/$archive"
+  verify_release "$stage" "$archive" "$key"
+  tar -xOf "$stage/$archive" aur-step > "$stage/aur-step"
+  chmod 755 "$stage/aur-step"
+  [[ $("$stage/aur-step" --version) == "aur-step $version" ]] || fail 'Executable version does not match the release tag.'
+  install -d -m 755 -o root -g root /usr/local/bin
+  replacement=$(mktemp /usr/local/bin/.aur-step.XXXXXXXX)
+  install -m 755 -o root -g root "$stage/aur-step" "$replacement"
+  mv -fT -- "$replacement" /usr/local/bin/aur-step
+  replacement=''
+  printf 'Installed aur-step %s (signature and checksum verified).\n' "$version"
+)
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

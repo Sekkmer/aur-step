@@ -1,0 +1,20 @@
+[Unit]
+Description=Update aur-step from signed GitHub releases
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/share/aur-step/release-signing-key.asc
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/aur-step-update
+UMask=0077
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/usr/local/bin
+RuntimeDirectory=aur-step-update
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TimeoutStartSec=15min
